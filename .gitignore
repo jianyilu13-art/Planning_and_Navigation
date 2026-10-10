@@ -1,0 +1,21 @@
+# ROS 2 build files
+**/build/
+**/install/
+**/log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# VS Code local settings
+.vscode/
+
+# ROS logs and temporary files
+*.log
+*.db3
+*.mcap
+
+# Cartographer temporary state
+*.pbstream

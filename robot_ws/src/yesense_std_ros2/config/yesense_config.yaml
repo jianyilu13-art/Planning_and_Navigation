@@ -1,0 +1,16 @@
+yesense_pub:
+    ros__parameters:
+        serial_port: "/dev/ttyACM0"
+        baud_rate: 460800
+        frame_id: "gyro_link"
+        driver_type: "ros_serial"
+        # Keep the 200 Hz sensor_msgs/Imu stream lightweight. Set true only
+        # when the vendor-specific visualization/navigation topics are needed.
+        publish_extended_topics: false
+
+        # Conservative measurement noise for robot_localization. The absolute
+        # yaw corrects gyro drift slowly; the gyro controls short-term turns.
+        orientation_stddev: 0.20          # rad
+        angular_velocity_stddev: 0.03     # rad/s
+        linear_acceleration_stddev: 0.35  # m/s^2
+

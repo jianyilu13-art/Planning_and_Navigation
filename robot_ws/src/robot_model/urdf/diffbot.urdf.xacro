@@ -1,0 +1,187 @@
+<?xml version="1.0"?>
+<robot name="diffbot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ============================================================
+       Configurable frame names (override with xacro args at launch)
+       ============================================================ -->
+  <xacro:arg name="base_frame" default="base_link"/>
+  <xacro:arg name="tracking_frame" default="imu_tracking"/>
+  <xacro:arg name="imu_frame" default="gyro_link"/>
+  <xacro:arg name="laser_frame" default="laser"/>
+  <!-- Yaw (radians) of the LiDAR scan frame relative to base_link forward
+       (+X). The RPLidar driver already reports angle zero along the sensor's
+       forward direction, so no additional half-turn belongs in TF. -->
+  <xacro:arg name="laser_yaw" default="3.141592653589793"/>
+  <xacro:property name="base_frame" value="$(arg base_frame)"/>
+  <xacro:property name="tracking_frame" value="$(arg tracking_frame)"/>
+  <xacro:property name="imu_frame" value="$(arg imu_frame)"/>
+  <xacro:property name="laser_frame" value="$(arg laser_frame)"/>
+  <xacro:property name="laser_yaw" value="$(arg laser_yaw)"/>
+
+  <!-- ============================================================
+       Configurable physical dimensions
+       ============================================================ -->
+  <xacro:property name="chassis_length" value="0.30"/>
+  <xacro:property name="chassis_width" value="0.25"/>
+  <xacro:property name="chassis_height" value="0.10"/>
+  <xacro:property name="chassis_mass" value="5.0"/>
+
+  <xacro:property name="wheel_radius" value="0.033"/>
+  <xacro:property name="wheel_width" value="0.02"/>
+  <xacro:property name="wheel_separation" value="0.288"/>
+  <xacro:property name="wheel_mass" value="0.5"/>
+
+  <xacro:property name="caster_radius" value="0.015"/>
+
+  <xacro:property name="lidar_radius" value="0.035"/>
+  <xacro:property name="lidar_height" value="0.04"/>
+  <!-- Measured sensor geometry. H30 is 50 mm above base origin. The LiDAR
+       is 52 mm behind and 40 mm above the H30. -->
+  <xacro:property name="imu_mount_z" value="0.050"/>
+  <xacro:property name="lidar_from_imu_x" value="-0.052"/>
+  <!-- gyro_link has down-positive Z because the H30 is installed FRD. -->
+  <xacro:property name="lidar_from_imu_z" value="-0.040"/>
+
+  <material name="grey">
+    <color rgba="0.5 0.5 0.5 1.0"/>
+  </material>
+  <material name="black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+  <material name="orange">
+    <color rgba="1.0 0.5 0.0 1.0"/>
+  </material>
+
+  <link name="${base_frame}">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+      <material name="grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="${chassis_mass}"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.05" ixy="0.0" ixz="0.0" iyy="0.08" iyz="0.0" izz="0.10"/>
+    </inertial>
+  </link>
+
+  <!-- ============================================================
+       Wheels (visual only - fixed joints; the real/simulated drive
+       external odometry EKF is responsible for publishing odom -> base_link,
+       so no joint_state_publisher is required for navigation)
+       ============================================================ -->
+  <xacro:macro name="wheel" params="prefix reflect">
+    <link name="${prefix}_wheel_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <material name="black"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="${wheel_mass}"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_wheel_joint" type="fixed">
+      <parent link="${base_frame}"/>
+      <child link="${prefix}_wheel_link"/>
+      <origin xyz="0 ${reflect * wheel_separation/2} ${-wheel_radius}" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:wheel prefix="left" reflect="1"/>
+  <xacro:wheel prefix="right" reflect="-1"/>
+
+  <!-- Caster (visual only) -->
+  <link name="caster_wheel_link">
+    <visual>
+      <geometry>
+        <sphere radius="${caster_radius}"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="${caster_radius}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.0001" ixy="0.0" ixz="0.0" iyy="0.0001" iyz="0.0" izz="0.0001"/>
+    </inertial>
+  </link>
+  <joint name="caster_wheel_joint" type="fixed">
+    <parent link="${base_frame}"/>
+    <child link="caster_wheel_link"/>
+    <origin xyz="${-chassis_length/2 + caster_radius} 0 ${-wheel_radius + caster_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Cartographer requires its tracking-frame origin to be colocated with
+       the IMU. Keep that frame FLU, then express the installed H30 FRD axes
+       as a zero-translation roll-pi child. -->
+  <link name="${tracking_frame}"/>
+  <joint name="imu_mount_joint" type="fixed">
+    <parent link="${base_frame}"/>
+    <child link="${tracking_frame}"/>
+    <origin xyz="0 0 ${imu_mount_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="${imu_frame}"/>
+  <joint name="imu_axes_joint" type="fixed">
+    <parent link="${tracking_frame}"/>
+    <child link="${imu_frame}"/>
+    <origin xyz="0 0 0" rpy="${pi} 0 0"/>
+  </joint>
+
+  <!-- ============================================================
+       2D LiDAR: gyro_link -> laser (fixed, robot_state_publisher)
+       ============================================================ -->
+  <link name="${laser_frame}">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${lidar_radius}" length="${lidar_height}"/>
+      </geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${lidar_radius}" length="${lidar_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.0001" ixy="0.0" ixz="0.0" iyy="0.0001" iyz="0.0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <joint name="laser_joint" type="fixed">
+    <parent link="${imu_frame}"/>
+    <child link="${laser_frame}"/>
+    <!-- In the FRD parent, physically upward is -Z. rpy=(pi,0,-yaw)
+         composes with base->gyro roll pi, restoring an FLU laser frame. -->
+    <origin xyz="${lidar_from_imu_x} 0 ${lidar_from_imu_z}"
+            rpy="${pi} 0 ${-laser_yaw}"/>
+  </joint>
+
+</robot>
