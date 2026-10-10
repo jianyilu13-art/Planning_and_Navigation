@@ -1,0 +1,12 @@
+# REQUIRED MANUAL CALIBRATION: set calibrated: true only after measuring these values.
+calibrated: false
+grid:
+  # Map-frame centre of square A (metres), measured in RViz against the saved map.
+  origin_x: 0.0
+  origin_y: 0.0
+  # Centre-to-centre square pitch, measured on the physical board.
+  spacing_m: 0.6
+  # Counter-clockwise board +x (A to B) angle relative to map +x.
+  rotation_deg: 0.0
+# Optional surveyed centres override regular-grid geometry, e.g. A: {x: 1.23, y: 4.56}
+overrides: {}

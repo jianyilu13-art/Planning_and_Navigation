@@ -1,0 +1,4 @@
+start:
+  square: A
+  bearing: N
+targets: [G, M, T, X]
