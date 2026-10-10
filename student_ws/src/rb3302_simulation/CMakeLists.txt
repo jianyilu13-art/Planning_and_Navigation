@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.8)
+project(rb3302_simulation)
+find_package(ament_cmake REQUIRED)
+install(DIRECTORY launch worlds models config rviz DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/generate_world.py DESTINATION lib/${PROJECT_NAME})
+ament_package()

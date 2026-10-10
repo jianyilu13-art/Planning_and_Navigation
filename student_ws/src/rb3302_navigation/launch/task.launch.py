@@ -13,8 +13,9 @@ def generate_launch_description():
     planning = get_package_share_directory('planning_rpp')
     arg = lambda name, default: DeclareLaunchArgument(name, default_value=default)
     return LaunchDescription([
-        arg('start_hardware', 'false'), arg('use_sim_time', 'false'), arg('rviz', 'true'), arg('map_ready', 'false'),
-        arg('map', PathJoinSubstitution([share, 'maps', 'map.yaml'])),
+        arg('start_hardware', 'false'), arg('use_sim_time', 'false'), arg('rviz', 'true'),
+        # The supplied map is deliberately outside this package and is never copied or altered.
+        arg('map', '/ssd/workspaces/rb3302_final_proj/student_ws/maps/rb3302_map.yaml'),
         arg('params_file', PathJoinSubstitution([share, 'config', 'navigation.yaml'])),
         arg('landmarks_file', PathJoinSubstitution([share, 'config', 'landmarks.yaml'])),
         arg('task_file', PathJoinSubstitution([share, 'config', 'task.yaml'])),
@@ -23,5 +24,5 @@ def generate_launch_description():
             'use_sim_time': LaunchConfiguration('use_sim_time'), 'map': LaunchConfiguration('map'), 'params_file': LaunchConfiguration('params_file'), 'rviz': LaunchConfiguration('rviz')}.items()),
         Node(package='rb3302_navigation', executable='task_manager', output='screen', parameters=[{
             'task_file': LaunchConfiguration('task_file'), 'landmarks_file': LaunchConfiguration('landmarks_file'),
-            'map_ready': LaunchConfiguration('map_ready')}]),
+            'use_sim_time': LaunchConfiguration('use_sim_time')}]),
     ])
