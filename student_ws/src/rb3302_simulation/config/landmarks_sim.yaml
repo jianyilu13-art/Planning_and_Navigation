@@ -1,0 +1,15 @@
+# Simulation-only calibration. Never use this file on the physical course.
+calibrated: true
+grid:
+  origin_x: 0.0
+  origin_y: 0.0
+  spacing_m: 0.5
+  # The physical task starts facing N; rotate the simulated board so that is
+  # Gazebo's spawn yaw (map +x).
+  rotation_deg: -90.0
+overrides:
+  A: {x: 0.0, y: 0.0}
+  G: {x: 0.5, y: 0.0}
+  M: {x: 0.0, y: 0.0}
+  T: {x: 0.5, y: 0.0}
+  X: {x: 0.0, y: 0.0}
