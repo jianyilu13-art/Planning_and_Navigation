@@ -27,15 +27,15 @@ def generate_launch_description():
         DeclareLaunchArgument('params_file', default_value=PathJoinSubstitution([nav, 'config', 'navigation.yaml'])),
         DeclareLaunchArgument('autostart', default_value='true'),
         DeclareLaunchArgument('rviz', default_value='true'),
-        DeclareLaunchArgument('map', default_value='/ssd/workspaces/rb3302_final_proj/student_ws/maps/rb3302_map.yaml'),
+        DeclareLaunchArgument('map', default_value=PathJoinSubstitution([sim, 'maps', 'rb3302_sim_map.yaml'])),
         Node(package='nav2_map_server', executable='map_server', name='map_server', output='screen', parameters=[params, {'use_sim_time': use_sim_time, 'yaml_filename': map_file}]),
-        # The simulated rover is spawned at the map origin.  Supplying that
+        # The simulated rover is spawned at landmark A's centre. Supplying that
         # pose lets AMCL establish map -> odom for standalone/manual Nav2
         # testing, where task_manager deliberately is not launched.
         Node(package='nav2_amcl', executable='amcl', name='amcl', output='screen',
              parameters=[params, {'use_sim_time': use_sim_time,
                                   'set_initial_pose': True,
-                                  'initial_pose': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}}],
+                                  'initial_pose': {'x': 0.3, 'y': 2.1, 'z': 0.0, 'yaw': 0.0}}],
              remappings=[('scan', '/scan')]),
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager', name='lifecycle_manager_localization', output='screen', parameters=[{'use_sim_time': use_sim_time, 'autostart': autostart, 'node_names': ['map_server', 'amcl']}]),
         Node(package='nav2_planner', executable='planner_server', name='planner_server', output='screen', parameters=common),

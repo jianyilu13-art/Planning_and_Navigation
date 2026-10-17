@@ -1,15 +1,29 @@
 # Simulation-only calibration. Never use this file on the physical course.
+# Centres follow x=(c+0.5)*0.6, y=(3.5-r)*0.6, where A is row 0/column 0.
 calibrated: true
-grid:
-  origin_x: 0.0
-  origin_y: 0.0
-  spacing_m: 0.5
-  # The physical task starts facing N; rotate the simulated board so that is
-  # Gazebo's spawn yaw (map +x).
-  rotation_deg: -90.0
+grid: {origin_x: 0.0, origin_y: 0.0, spacing_m: 0.6, rotation_deg: 0.0}
 overrides:
-  A: {x: 0.0, y: 0.0}
-  G: {x: 0.5, y: 0.0}
-  M: {x: 0.0, y: 0.0}
-  T: {x: 0.5, y: 0.0}
-  X: {x: 0.0, y: 0.0}
+  A: {x: 0.3, y: 2.1}
+  B: {x: 0.9, y: 2.1}
+  C: {x: 1.5, y: 2.1}
+  D: {x: 2.1, y: 2.1}
+  E: {x: 2.7, y: 2.1}
+  F: {x: 3.3, y: 2.1}
+  G: {x: 0.3, y: 1.5}
+  H: {x: 0.9, y: 1.5}
+  I: {x: 1.5, y: 1.5}
+  J: {x: 2.1, y: 1.5}
+  K: {x: 2.7, y: 1.5}
+  L: {x: 3.3, y: 1.5}
+  M: {x: 0.3, y: 0.9}
+  N: {x: 0.9, y: 0.9}
+  O: {x: 1.5, y: 0.9}
+  P: {x: 2.1, y: 0.9}
+  Q: {x: 2.7, y: 0.9}
+  R: {x: 3.3, y: 0.9}
+  S: {x: 0.3, y: 0.3}
+  T: {x: 0.9, y: 0.3}
+  U: {x: 1.5, y: 0.3}
+  V: {x: 2.1, y: 0.3}
+  W: {x: 2.7, y: 0.3}
+  X: {x: 3.3, y: 0.3}
