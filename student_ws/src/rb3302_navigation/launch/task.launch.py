@@ -16,7 +16,7 @@ def generate_launch_description():
         arg('start_hardware', 'false'), arg('use_sim_time', 'false'), arg('rviz', 'true'),
         # The supplied map is deliberately outside this package and is never copied or altered.
         arg('map', '/ssd/workspaces/rb3302_final_proj/student_ws/maps/rb3302_map.yaml'),
-        arg('params_file', PathJoinSubstitution([planning, 'config', 'nav2_params.yaml'])),
+        arg('params_file', PathJoinSubstitution([share, 'config', 'nav2_real.yaml'])),
         arg('landmarks_file', PathJoinSubstitution([share, 'config', 'landmarks.yaml'])),
         arg('task_file', PathJoinSubstitution([share, 'config', 'task.yaml'])),
         IncludeLaunchDescription(PythonLaunchDescriptionSource(PathJoinSubstitution([get_package_share_directory('robot_init'), 'launch', 'robot.launch.py'])), condition=IfCondition(LaunchConfiguration('start_hardware'))),
