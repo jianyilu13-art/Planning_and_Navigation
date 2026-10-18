@@ -24,7 +24,7 @@ def generate_launch_description():
     autostart = LaunchConfiguration('autostart')
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
-        DeclareLaunchArgument('params_file', default_value=PathJoinSubstitution([nav, 'config', 'navigation.yaml'])),
+        DeclareLaunchArgument('params_file', default_value=PathJoinSubstitution([sim, 'config', 'nav2_sim.yaml'])),
         DeclareLaunchArgument('autostart', default_value='true'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument('map', default_value=PathJoinSubstitution([sim, 'maps', 'rb3302_sim_map.yaml'])),
