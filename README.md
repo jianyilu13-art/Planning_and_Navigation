@@ -75,3 +75,80 @@ rb3302_final_proj/
 | Mission Controller | Shared TaskManager | Shared TaskManager |
 
 The simulation and real robot use separate navigation configurations while sharing the same mission logic.
+
+## Quick Start
+
+### Requirements
+
+- Ubuntu 24.04
+- ROS 2 Jazzy
+- Gazebo Harmonic
+- ROS 2 Nav2
+- Python 3
+- Colcon and rosdep
+
+### 1. Clone Repository
+
+```bash
+git clone <YOUR_REPOSITORY_URL>
+cd rb3302_final_proj
+```
+
+### 2. Install Dependencies
+
+```bash
+source /opt/ros/jazzy/setup.bash
+
+cd student_ws
+
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+Ensure Gazebo Harmonic, Nav2, and any dependencies not declared in `package.xml` are installed.
+
+### 3. Build Workspace
+
+```bash
+colcon build --symlink-install
+
+source install/setup.bash
+```
+
+### 4. Run Gazebo Simulation
+
+```bash
+export ROS_DOMAIN_ID=72
+export GZ_PARTITION=rb3302_sim
+```
+
+**Manual navigation (two terminals):**
+
+Terminal 1 — Gazebo:
+
+```bash
+ros2 launch rb3302_simulation simulation.launch.py gui:=true
+```
+
+Terminal 2 — Nav2 + RViz:
+
+```bash
+ros2 launch rb3302_simulation sim_navigation.launch.py rviz:=true
+```
+
+Source ROS 2 and `student_ws/install/setup.bash` in both terminals.
+
+**Automatic four-landmark mission:**
+
+```bash
+ros2 launch rb3302_simulation task_sim.launch.py
+```
+
+Stop any existing manual simulation sessions before starting the automatic mission.
+
+### 5. Real-World Navigation
+
+The physical Wave Rover requires the `robot_ws` drivers, a calibrated map, and real-world navigation parameters.
+
+See [Real-World Navigation](student_ws/src/rb3302_navigation/README.md) for hardware initialization, mapping, manual navigation, and the graded-run workflow.
+
+> **Note:** The simulation has been tested on the development machine. A clean installation on another computer has not yet been verified.

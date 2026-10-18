@@ -90,8 +90,8 @@ simulation.launch.py           sim_navigation.launch.py
     │                                  │
     ├── Gazebo                         ├── nav2_sim.yaml
     ├── Wave Rover                     ├── Map Server
-    ├── LiDAR                           ├── AMCL
-    ├── Odometry                        ├── Navfn A*
+    ├── LiDAR                          ├── AMCL
+    ├── Odometry                       ├── Navfn A*
     └── ROS-Gazebo Bridge              ├── RPP Controller
                                        ├── Velocity Smoother
                                        └── RViz
