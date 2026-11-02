@@ -4,7 +4,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 
 
@@ -14,8 +14,9 @@ def generate_launch_description():
     arg = lambda name, default: DeclareLaunchArgument(name, default_value=default)
     return LaunchDescription([
         arg('start_hardware', 'false'), arg('use_sim_time', 'false'), arg('rviz', 'true'),
-        # The supplied map is deliberately outside this package and is never copied or altered.
-        arg('map', '/ssd/workspaces/rb3302_final_proj/student_ws/maps/rb3302_map.yaml'),
+        # Map remains outside this package.  This default is deliberately the
+        # robot source-workspace layout; laptop invocations must pass `map:=`.
+        arg('map', PathJoinSubstitution([EnvironmentVariable('HOME'), 'rb3302_final_proj_code', 'student_ws', 'maps', 'rb3302_map.yaml'])),
         arg('params_file', PathJoinSubstitution([share, 'config', 'nav2_real.yaml'])),
         arg('landmarks_file', PathJoinSubstitution([share, 'config', 'landmarks.yaml'])),
         arg('task_file', PathJoinSubstitution([share, 'config', 'task.yaml'])),

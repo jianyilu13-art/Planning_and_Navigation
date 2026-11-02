@@ -1,5 +1,46 @@
 # RB3302 Real-World Navigation
 
+## Physical graded-run launch
+
+The following commands are prepared for the robot's documented source-space
+layout. They were statically verified against this package and the supplied
+`planning_rpp` launch, but cannot be runtime-verified without the robot.
+
+```bash
+cd /home/ubuntu/rb3302_final_proj_code/student_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select rb3302_navigation
+source install/setup.bash
+
+# Starts hardware once plus the supplied EKF/Nav2 stack; headless by design.
+ros2 launch rb3302_navigation task.launch.py \
+  start_hardware:=true use_sim_time:=false rviz:=false \
+  map:=/home/ubuntu/rb3302_final_proj_code/student_ws/maps/rb3302_map.yaml \
+  params_file:=/home/ubuntu/rb3302_final_proj_code/student_ws/src/rb3302_navigation/config/nav2_real.yaml
+```
+
+If `robot_init` is already running in another terminal, use
+`start_hardware:=false`; do not launch the drivers twice. Before a run, set the
+four targets and start square in `task.yaml`, and set `calibrated: true` in
+`landmarks.yaml` only after measured map-frame calibration.
+
+Useful non-motion diagnostics after the stack is running:
+
+```bash
+ros2 topic info /scan -v; ros2 topic hz /scan; ros2 topic hz /odom
+ros2 topic echo /amcl_pose --once; ros2 action list
+ros2 lifecycle get /amcl; ros2 lifecycle get /planner_server
+ros2 lifecycle get /controller_server
+ros2 run tf2_ros tf2_echo map odom
+ros2 run tf2_ros tf2_echo odom base_link
+```
+
+`task_manager` now waits for both Nav2 and EKF `odom -> base_link` before it
+sends a single `/initialpose`; repeat initialization is opt-in only. The Nav2
+goal checker is position-only (0.10 m), while task verification is 0.15 m.
+Final heading is intentionally not required. `Ctrl-C` uses a best-effort stop
+and no longer publishes after the ROS context has shut down.
+
 ROS 2 Jazzy navigation for the physical Waveshare Wave Rover.
 
 Supports:

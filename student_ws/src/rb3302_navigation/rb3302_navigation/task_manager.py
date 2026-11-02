@@ -131,8 +131,9 @@ class TaskManager(Node):
             # Time robot must remain stopped at each landmark
             'dwell_seconds': 3.0,
 
-            # Desired orientation at each navigation target
-            'goal_orientation': 'start_bearing',
+            # Initial bearing is for AMCL only. PositionGoalChecker makes the
+            # final heading irrelevant to graded-run completion.
+            'goal_orientation': 'none',
 
             # Maximum time waiting for Nav2 to accept a goal
             'goal_acceptance_timeout_seconds': 5.0,
@@ -158,7 +159,11 @@ class TaskManager(Node):
             'stop_angular_tolerance': 0.05,
 
             # Maximum distance between robot and target
-            'goal_xy_tolerance': 0.18,
+            'goal_xy_tolerance': 0.15,
+
+            # Do not continually reset AMCL on real hardware. Enable only for
+            # a deliberate recovery experiment.
+            'republish_initial_pose': False,
         }
 
         # Register parameters with ROS 2
@@ -295,6 +300,7 @@ class TaskManager(Node):
 
         # Time when initial pose was last published
         self._last_initial_pose = 0.0
+        self._initial_pose_stamp_ns = None
 
         # ----------------------------------------------------
         # G. Load task configuration
@@ -404,7 +410,12 @@ class TaskManager(Node):
         TaskManager -> /cmd_vel -> Robot
         """
 
-        self.stop_pub.publish(Twist())
+        # Ctrl-C may invalidate the rcl context before `finally` executes.
+        if rclpy.ok():
+            try:
+                self.stop_pub.publish(Twist())
+            except Exception as exc:
+                self.get_logger().debug(f'Unable to publish stop during shutdown: {exc}')
 
     # ========================================================
     # 5. SUBSCRIBER CALLBACKS
@@ -484,6 +495,7 @@ class TaskManager(Node):
 
         # Record publication time
         self._last_initial_pose = self._now()
+        self._initial_pose_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
     # ========================================================
     # 7. CHECK LOCALIZATION
@@ -505,6 +517,12 @@ class TaskManager(Node):
 
         # No pose or incorrect frame
         if msg is None or msg.header.frame_id != 'map':
+            return False
+
+        # A pose received before this task's initialization cannot establish
+        # readiness for this task. Allow a small scan/TF timestamp lag.
+        pose_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if self._initial_pose_stamp_ns is None or pose_stamp_ns + 500_000_000 < self._initial_pose_stamp_ns:
             return False
 
         # Get covariance
@@ -558,6 +576,17 @@ class TaskManager(Node):
             abs(t.angular.z)
             <= self._param('stop_angular_tolerance')
         )
+
+    def _odometry_tf_ready(self):
+        """Require the EKF's live odom -> base_link before initializing AMCL."""
+        if self._last_odom is None:
+            return False
+        try:
+            return self.tf_buffer.can_transform(
+                'odom', 'base_link', rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0))
+        except Exception:
+            return False
 
     # ========================================================
     # 9. FAILURE HANDLING
@@ -665,9 +694,14 @@ class TaskManager(Node):
                 self.task['start']['bearing']
             )
 
-        else:
+        elif self._param('goal_orientation') == 'none':
 
             yaw = 0.0
+
+        else:
+
+            self._fail('goal_orientation must be none or start_bearing')
+            return
 
         # ----------------------------------------------------
         # D. Create Nav2 navigation goal
@@ -942,7 +976,10 @@ class TaskManager(Node):
         if self.state is TaskState.WAITING_FOR_NAV2:
 
             # Check whether Nav2 action server is available
-            if self.client.wait_for_server(timeout_sec=0.0):
+            # AMCL must not receive an initial pose before the supplied EKF has
+            # started publishing odom -> base_link; that race generated the
+            # observed future-extrapolation warnings.
+            if self.client.wait_for_server(timeout_sec=0.0) and self._odometry_tf_ready():
 
                 # Start overall mission timer
                 self._overall_deadline = (
@@ -982,8 +1019,9 @@ class TaskManager(Node):
                 )
                 return
 
-            # Republish initial pose approximately every second
-            if now - self._last_initial_pose >= 1.0:
+            # Repeated initialpose messages reset AMCL and were the source of
+            # repeated transform-future warnings in the physical run.
+            if self._param('republish_initial_pose') and now - self._last_initial_pose >= 1.0:
 
                 self._publish_initial_pose()
 
@@ -1028,6 +1066,8 @@ class TaskManager(Node):
 
             # Check whether robot has stopped
             if not self._robot_stopped():
+                # Dwell means continuously stationary for the full period.
+                self._dwell_deadline = None
                 return
 
             # Start dwell timer if it has not started
