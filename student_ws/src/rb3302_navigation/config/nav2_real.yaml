@@ -11,11 +11,11 @@ amcl:
     # Motion model
     robot_model_type: nav2_amcl::DifferentialMotionModel
 
-    alpha1: 0.5
-    alpha2: 0.5
-    alpha3: 0.5
-    alpha4: 0.5
-    alpha5: 0.5
+    alpha1: 0.9
+    alpha2: 0.3
+    alpha3: 0.4
+    alpha4: 0.4
+    alpha5: 0.3
 
     # Particle filter
     min_particles: 500
@@ -34,8 +34,8 @@ amcl:
     laser_likelihood_max_dist: 2.0
 
     # Localization updates
-    update_min_d: 0.10  # These parameters determine the motion required before AMCL performs another laser-based update.
-    update_min_a: 0.10
+    update_min_d: 0.05  # These parameters determine the motion required before AMCL performs another laser-based update.
+    update_min_a: 0.05
 
     # Particle resampling
     resample_interval: 1
@@ -68,13 +68,15 @@ controller_server:
     controller_plugins: ["FollowPath"]
 
     progress_checker:
-      plugin: nav2_controller::SimpleProgressChecker  # Check if robot is making progress
+      plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.001
+      movement_time_allowance: 15.0  # Check if robot is making progress
 
     # The rubric has no final-heading requirement.  Jazzy ships this plugin
     # (verified in nav2_controller/plugins.xml), so completion is position-only.
     goal_checker:
       plugin: nav2_controller::PositionGoalChecker
-      xy_goal_tolerance: 0.10
+      xy_goal_tolerance: 0.08
       stateful: true
 
     FollowPath:
@@ -84,7 +86,7 @@ controller_server:
       desired_linear_vel: 0.2                # Desired forward speed (m/s)
 
       # ===== Path Following =====
-      lookahead_dist: 0.6                    # Fixed lookahead distance (m)
+      lookahead_dist: 0.3                    # Fixed lookahead distance (m)
       min_lookahead_dist: 0.3                # Minimum adaptive lookahead (m)
       max_lookahead_dist: 0.9                # Maximum adaptive lookahead (m)
       lookahead_time: 1.5                    # Time used for adaptive lookahead (s)

@@ -29,6 +29,8 @@ import rclpy
 
 # ROS 2 action status constants
 from action_msgs.msg import GoalStatus
+from lifecycle_msgs.msg import State as LifecycleState
+from lifecycle_msgs.srv import GetState
 
 # ROS 2 message types
 from geometry_msgs.msg import (
@@ -71,6 +73,8 @@ class TaskState(enum.Enum):
     INITIALIZING_LOCALIZATION = enum.auto()
 
     WAITING_FOR_LOCALIZATION = enum.auto()
+
+    WAITING_FOR_NAV2_LIFECYCLE = enum.auto()
 
     NAVIGATING = enum.auto()
 
@@ -139,13 +143,26 @@ class TaskManager(Node):
             'goal_acceptance_timeout_seconds': 5.0,
 
             # Maximum navigation time for EACH landmark
-            'navigation_timeout_seconds': 40.0,
+            'navigation_timeout_seconds': 120.0,
 
             # Maximum time allowed for cancelling navigation
             'cancellation_timeout_seconds': 5.0,
 
             # Maximum time allowed for localization
             'localization_timeout_seconds': 25.0,
+
+            # Time to wait after localization for Nav2's managed navigation
+            # nodes to finish their lifecycle activation.
+            'nav2_activation_timeout_seconds': 45.0,
+
+            # Lifecycle requests are asynchronous and intentionally sampled,
+            # rather than blocking the executor during Nav2 startup.
+            'lifecycle_check_period_seconds': 0.5,
+
+            # A rejected startup goal is retried only a bounded number of
+            # times, after lifecycle state has been checked again.
+            'startup_goal_retries': 2,
+            'startup_goal_retry_delay_seconds': 1.0,
 
             # Maximum time for the complete mission
             'overall_timeout_seconds': 180.0,
@@ -214,6 +231,34 @@ class TaskManager(Node):
             'navigate_to_pose'
         )
 
+        # These are the nodes managed by planning_rpp/planning.launch.py.
+        # Keep the list configurable for a simulation that intentionally
+        # launches a smaller Nav2 stack.
+        self.declare_parameter(
+            'required_nav2_lifecycle_nodes',
+            [
+                '/planner_server',
+                '/controller_server',
+                '/smoother_server',
+                '/behavior_server',
+                '/bt_navigator',
+                '/waypoint_follower',
+                '/velocity_smoother',
+            ]
+        )
+        self._lifecycle_clients = {
+            node_name: self.create_client(GetState, f'{node_name}/get_state')
+            for node_name in self._param('required_nav2_lifecycle_nodes')
+        }
+        self._lifecycle_futures = {
+            node_name: None for node_name in self._lifecycle_clients
+        }
+        self._lifecycle_states = {
+            node_name: None for node_name in self._lifecycle_clients
+        }
+        self._last_lifecycle_refresh = float('-inf')
+        self._last_lifecycle_wait_log = float('-inf')
+
         # ----------------------------------------------------
         # D. Create ROS subscribers
         # ----------------------------------------------------
@@ -276,6 +321,11 @@ class TaskManager(Node):
 
         # True while waiting for Nav2 to accept a goal
         self.goal_pending = False
+
+        # Number of submissions for the current target.  This is only used
+        # for a bounded recovery from a startup-time action rejection.
+        self._goal_attempts = 0
+        self._goal_retry_at = None
 
         # Current landmark label, e.g. "G"
         self.current_goal_label = None
@@ -345,6 +395,14 @@ class TaskManager(Node):
             # converter.coordinate('G') -> (x, y)
 
             self.converter = LandmarkConverter(config)
+
+            self.get_logger().info(
+                f"[TASK] Loaded starting square {self.task['start']['square']}, "
+                f"bearing {self.task['start']['bearing']}"
+            )
+            self.get_logger().info(
+                '[TASK] Loaded targets: ' + ', '.join(self.task['targets'])
+            )
 
         except Exception as exc:
 
@@ -496,6 +554,7 @@ class TaskManager(Node):
         # Record publication time
         self._last_initial_pose = self._now()
         self._initial_pose_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        self.get_logger().info('[AMCL] Initial pose published')
 
     # ========================================================
     # 7. CHECK LOCALIZATION
@@ -589,7 +648,84 @@ class TaskManager(Node):
             return False
 
     # ========================================================
-    # 9. FAILURE HANDLING
+    # 9. NAV2 LIFECYCLE READINESS
+    # ========================================================
+
+    @staticmethod
+    def _lifecycle_state_name(state_id):
+        """Return a useful, stable name for lifecycle logging."""
+        names = {
+            LifecycleState.PRIMARY_STATE_UNKNOWN: 'UNKNOWN',
+            LifecycleState.PRIMARY_STATE_UNCONFIGURED: 'UNCONFIGURED',
+            LifecycleState.PRIMARY_STATE_INACTIVE: 'INACTIVE',
+            LifecycleState.PRIMARY_STATE_ACTIVE: 'ACTIVE',
+            LifecycleState.PRIMARY_STATE_FINALIZED: 'FINALIZED',
+        }
+        return names.get(state_id, f'STATE_{state_id}')
+
+    def _refresh_lifecycle_states(self, now):
+        """Poll cached lifecycle clients without blocking the executor."""
+        for node_name, future in self._lifecycle_futures.items():
+            if future is not None and future.done():
+                self._lifecycle_futures[node_name] = None
+                try:
+                    state_id = future.result().current_state.id
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f'[NAV2] {node_name}: lifecycle query failed: {exc}'
+                    )
+                    state_id = None
+
+                if self._lifecycle_states[node_name] != state_id:
+                    self._lifecycle_states[node_name] = state_id
+                    label = ('service unavailable' if state_id is None else
+                             self._lifecycle_state_name(state_id))
+                    self.get_logger().info(f'[NAV2] {node_name}: {label}')
+
+        if now - self._last_lifecycle_refresh < self._param('lifecycle_check_period_seconds'):
+            return
+
+        self._last_lifecycle_refresh = now
+        for node_name, client in self._lifecycle_clients.items():
+            if self._lifecycle_futures[node_name] is not None:
+                continue
+            if not client.service_is_ready():
+                if self._lifecycle_states[node_name] is not None:
+                    self._lifecycle_states[node_name] = None
+                    self.get_logger().info(f'[NAV2] {node_name}: service unavailable')
+                continue
+            try:
+                self._lifecycle_futures[node_name] = client.call_async(GetState.Request())
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'[NAV2] {node_name}: unable to request lifecycle state: {exc}'
+                )
+
+    def _nav2_lifecycle_ready(self, now):
+        """Return True only after every required navigation node is ACTIVE."""
+        self._refresh_lifecycle_states(now)
+        inactive = [
+            node_name for node_name, state_id in self._lifecycle_states.items()
+            if state_id != LifecycleState.PRIMARY_STATE_ACTIVE
+        ]
+        if not inactive:
+            return True
+
+        if now - self._last_lifecycle_wait_log >= 5.0:
+            summary = ', '.join(
+                f'{node_name}={self._lifecycle_state_name(self._lifecycle_states[node_name])}'
+                if self._lifecycle_states[node_name] is not None
+                else f'{node_name}=UNAVAILABLE'
+                for node_name in inactive
+            )
+            self.get_logger().info(
+                f'[NAV2] Waiting for lifecycle activation: {summary}'
+            )
+            self._last_lifecycle_wait_log = now
+        return False
+
+    # ========================================================
+    # 10. FAILURE HANDLING
     # ========================================================
 
     def _fail(self, reason):
@@ -617,7 +753,7 @@ class TaskManager(Node):
 
         # If an accepted navigation goal exists,
         # request cancellation from Nav2.
-        if self.goal_handle is not None:
+        if self.goal_handle is not None and self.goal_handle.accepted:
 
             self.goal_handle.cancel_goal_async()
 
@@ -632,7 +768,7 @@ class TaskManager(Node):
             self._set_state(TaskState.FAILED)
 
     # ========================================================
-    # 10. SEND NEXT NAVIGATION GOAL
+    # 11. SEND NEXT NAVIGATION GOAL
     # ========================================================
 
     def _send_next_goal(self):
@@ -730,6 +866,7 @@ class TaskManager(Node):
 
         # Mark goal as waiting for acceptance
         self.goal_pending = True
+        self._goal_attempts += 1
 
         # Enter NAVIGATING state with acceptance timeout
         self._set_state(
@@ -759,7 +896,7 @@ class TaskManager(Node):
         )
 
     # ========================================================
-    # 11. NAV2 GOAL ACCEPTANCE CALLBACK
+    # 12. NAV2 GOAL ACCEPTANCE CALLBACK
     # ========================================================
 
     def _goal_response(self, future):
@@ -798,8 +935,39 @@ class TaskManager(Node):
             self.goal_handle is None
             or not self.goal_handle.accepted
         ):
+            # A rejected response can contain a non-None handle.  It is not
+            # an active goal and must never be passed to cancellation logic.
+            self.goal_handle = None
+            retries = self._param('startup_goal_retries')
+            # Only the first target can plausibly race Nav2's startup.  A
+            # rejection later in the mission is a navigation failure, not a
+            # reason to replay an already-running mission step.
+            if self.goal_index == 0 and self._goal_attempts <= retries:
+                self._goal_retry_at = (
+                    self._now()
+                    + self._param('startup_goal_retry_delay_seconds')
+                )
+                # Do not decide the retry using the state snapshot that
+                # preceded the rejected request.
+                for node_name in self._lifecycle_states:
+                    self._lifecycle_states[node_name] = None
+                self._last_lifecycle_refresh = float('-inf')
+                self.get_logger().warn(
+                    f'[NAV] Target {self.goal_index + 1}/4 '
+                    f'{self.current_goal_label} rejected before execution; '
+                    f'rechecking Nav2 lifecycle before retry '
+                    f'{self._goal_attempts}/{retries}'
+                )
+                self._set_state(
+                    TaskState.WAITING_FOR_NAV2_LIFECYCLE,
+                    self._param('nav2_activation_timeout_seconds')
+                )
+                return
 
-            self._fail('Nav2 rejected goal')
+            self._fail(
+                f'Nav2 rejected target {self.goal_index + 1}/4 '
+                f'{self.current_goal_label} after {self._goal_attempts} attempts'
+            )
             return
 
         # Nav2 accepted the goal.
@@ -819,7 +987,7 @@ class TaskManager(Node):
         )
 
     # ========================================================
-    # 12. NAV2 NAVIGATION RESULT CALLBACK
+    # 13. NAV2 NAVIGATION RESULT CALLBACK
     # ========================================================
 
     def _goal_result(self, future):
@@ -909,7 +1077,7 @@ class TaskManager(Node):
         )
 
     # ========================================================
-    # 13. MAIN TIMER CALLBACK — TASK STATE MACHINE
+    # 14. MAIN TIMER CALLBACK — TASK STATE MACHINE
     # ========================================================
 
     def tick(self):
@@ -979,7 +1147,14 @@ class TaskManager(Node):
             # AMCL must not receive an initial pose before the supplied EKF has
             # started publishing odom -> base_link; that race generated the
             # observed future-extrapolation warnings.
-            if self.client.wait_for_server(timeout_sec=0.0) and self._odometry_tf_ready():
+            action_ready = self.client.wait_for_server(timeout_sec=0.0)
+            odom_ready = self._odometry_tf_ready()
+            if action_ready and odom_ready:
+
+                self.get_logger().info(
+                    '[STARTUP] NavigateToPose action server available; '
+                    'odom -> base_link available'
+                )
 
                 # Start overall mission timer
                 self._overall_deadline = (
@@ -987,12 +1162,24 @@ class TaskManager(Node):
                 )
 
                 # Initialize robot starting position
+                self.get_logger().info('[AMCL] Publishing initial pose')
                 self._publish_initial_pose()
 
                 # Enter localization initialization state
                 self._set_state(
                     TaskState.INITIALIZING_LOCALIZATION,
                     self._param('localization_timeout_seconds')
+                )
+
+            elif not action_ready:
+                self.get_logger().info(
+                    '[STARTUP] Waiting for NavigateToPose action server',
+                    throttle_duration_sec=5.0
+                )
+            else:
+                self.get_logger().info(
+                    '[ODOM] Waiting for odom -> base_link transform',
+                    throttle_duration_sec=5.0
                 )
 
         # ----------------------------------------------------
@@ -1006,9 +1193,11 @@ class TaskManager(Node):
 
             # Check whether localization is ready
             if self._localization_ready():
-
-                # Localization ready -> send first target
-                self._send_next_goal()
+                self.get_logger().info('[AMCL] Localization ready')
+                self._set_state(
+                    TaskState.WAITING_FOR_NAV2_LIFECYCLE,
+                    self._param('nav2_activation_timeout_seconds')
+                )
                 return
 
             # Check localization timeout
@@ -1029,7 +1218,27 @@ class TaskManager(Node):
             self.state = TaskState.WAITING_FOR_LOCALIZATION
 
         # ----------------------------------------------------
-        # F. STATE: NAVIGATING
+        # F. STATE: WAITING FOR NAV2 LIFECYCLE ACTIVATION
+        # ----------------------------------------------------
+
+        elif self.state is TaskState.WAITING_FOR_NAV2_LIFECYCLE:
+
+            if now >= self._state_deadline:
+                self._fail('Nav2 lifecycle activation timeout')
+                return
+
+            if not self._nav2_lifecycle_ready(now):
+                return
+
+            if self._goal_retry_at is not None and now < self._goal_retry_at:
+                return
+
+            self._goal_retry_at = None
+            self.get_logger().info('[NAV2] All required navigation nodes ACTIVE')
+            self._send_next_goal()
+
+        # ----------------------------------------------------
+        # G. STATE: NAVIGATING
         # ----------------------------------------------------
 
         elif self.state is TaskState.NAVIGATING:
@@ -1042,7 +1251,7 @@ class TaskManager(Node):
                 )
 
         # ----------------------------------------------------
-        # G. STATE: CANCELLING
+        # H. STATE: CANCELLING
         # ----------------------------------------------------
 
         elif self.state is TaskState.CANCELLING:
@@ -1059,7 +1268,7 @@ class TaskManager(Node):
                 )
 
         # ----------------------------------------------------
-        # H. STATE: DWELLING
+        # I. STATE: DWELLING
         # ----------------------------------------------------
 
         elif self.state is TaskState.DWELLING:
@@ -1082,6 +1291,7 @@ class TaskManager(Node):
 
                 # Move to next target index
                 self.goal_index += 1
+                self._goal_attempts = 0
 
                 # Send next goal or finish mission
                 self._send_next_goal()
@@ -1124,4 +1334,5 @@ def main():
         node.destroy_node()
 
         # Shut down ROS 2
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
