@@ -1,4 +1,4 @@
 start:
-  square: J
-  bearing: N
-targets: [D, G, S, U]
+  square: A
+  bearing: NW
+targets: [H, J, K, X]
