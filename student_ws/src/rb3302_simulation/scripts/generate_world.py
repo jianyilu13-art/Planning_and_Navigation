@@ -39,13 +39,28 @@ def main():
     map_height = math.ceil((rows * spacing + 2 * spacing) / args.resolution)
     data = bytearray([254]) * (width * map_height)
     def mark(x, y, sx, sy):
-        for row in range(map_height):
-            cy = ymin + (map_height - row - .5) * args.resolution
-            for column in range(width):
-                cx = xmin + (column + .5) * args.resolution
-                # Mark cells whose 5-cm footprint intersects the physical wall.
-                # A centre-only test would erase a 1-cm wall between pixels.
-                if abs(cx - x) <= sx / 2 + args.resolution / 2 and abs(cy - y) <= sy / 2 + args.resolution / 2:
+        """Rasterize an axis-aligned wall as one occupied cell across its width.
+
+        Wall centre-lines lie on the grid vertices, so a one-cell raster cannot
+        be centred on them exactly.  Use the cell immediately north/east of the
+        line and include both segment endpoints; this keeps all junctions
+        connected and represents every centre-line at its declared coordinate.
+        """
+        if sx <= args.resolution:  # Vertical wall.
+            column = round((x - xmin) / args.resolution)
+            first = round((y - sy / 2 - ymin) / args.resolution)
+            last = round((y + sy / 2 - ymin) / args.resolution)
+            for grid_y in range(first, last + 1):
+                row = map_height - 1 - grid_y
+                if 0 <= column < width and 0 <= row < map_height:
+                    data[row * width + column] = 0
+        else:  # Horizontal wall.
+            grid_y = round((y - ymin) / args.resolution)
+            row = map_height - 1 - grid_y
+            first = round((x - sx / 2 - xmin) / args.resolution)
+            last = round((x + sx / 2 - xmin) / args.resolution)
+            for column in range(first, last + 1):
+                if 0 <= column < width and 0 <= row < map_height:
                     data[row * width + column] = 0
     for horizontal, x, y, length in walls:
         mark(x, y, length if horizontal else thickness, thickness if horizontal else length)

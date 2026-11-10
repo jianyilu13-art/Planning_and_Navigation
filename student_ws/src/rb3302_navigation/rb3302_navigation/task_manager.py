@@ -78,6 +78,14 @@ class TaskState(enum.Enum):
 
     NAVIGATING = enum.auto()
 
+    RECOVERY_WAIT = enum.auto()
+
+    RECOVERY_CHECK = enum.auto()
+
+    RECOVERY_CANCEL = enum.auto()
+
+    # CANCELLING is reserved for terminal cancellation.  A retry uses
+    # RECOVERY_CANCEL so an intentional stop can never start another goal.
     CANCELLING = enum.auto()
 
     DWELLING = enum.auto()
@@ -164,8 +172,14 @@ class TaskManager(Node):
             'startup_goal_retries': 2,
             'startup_goal_retry_delay_seconds': 1.0,
 
+            # General navigation recovery.  max_navigation_retries counts
+            # additional submissions after the first attempt at a waypoint.
+            'max_navigation_retries': 5,
+            'retry_delay_seconds': 2.0,
+            'recovery_readiness_timeout_seconds': 10.0,
+
             # Maximum time for the complete mission
-            'overall_timeout_seconds': 180.0,
+            'overall_timeout_seconds': 300.0,
 
             # Localization uncertainty limits
             'localization_xy_variance_limit': 0.25,
@@ -256,6 +270,14 @@ class TaskManager(Node):
         self._lifecycle_states = {
             node_name: None for node_name in self._lifecycle_clients
         }
+        # Record when each lifecycle request was started.  Recovery accepts
+        # ACTIVE only from requests issued after recovery checking began.
+        self._lifecycle_query_started = {
+            node_name: float('-inf') for node_name in self._lifecycle_clients
+        }
+        self._lifecycle_state_query_started = {
+            node_name: float('-inf') for node_name in self._lifecycle_clients
+        }
         self._last_lifecycle_refresh = float('-inf')
         self._last_lifecycle_wait_log = float('-inf')
 
@@ -322,10 +344,31 @@ class TaskManager(Node):
         # True while waiting for Nav2 to accept a goal
         self.goal_pending = False
 
-        # Number of submissions for the current target.  This is only used
-        # for a bounded recovery from a startup-time action rejection.
+        # Submission and retry counts for the current target.  Retries count
+        # additional submissions, not the initial attempt.
         self._goal_attempts = 0
+        self._navigation_retries = 0
         self._goal_retry_at = None
+
+        # Every asynchronous action callback carries this generation.  A new
+        # generation is not created until the preceding one is fully settled.
+        self._next_attempt_id = 0
+        self._active_attempt_id = None
+        self._goal_send_future = None
+        self._goal_result_future = None
+        self._cancel_future = None
+        self._goal_terminal = False
+        self._cancel_for_retry = False
+        self._cancel_reason = None
+        self._cancel_result_status = None
+        self._stale_goal_handles = {}
+
+        # Recovery readiness always uses fresh lifecycle samples and never
+        # changes the mission-wide deadline.
+        self._recovery_check_started_at = None
+        self._recovery_reason = None
+        self._terminal_failure_reason = None
+        self._shutdown_requested = False
 
         # Current landmark label, e.g. "G"
         self.current_goal_label = None
@@ -560,7 +603,7 @@ class TaskManager(Node):
     # 7. CHECK LOCALIZATION
     # ========================================================
 
-    def _localization_ready(self):
+    def _localization_ready(self, require_recent=False):
         """
         Check whether AMCL localization is ready.
 
@@ -583,6 +626,14 @@ class TaskManager(Node):
         pose_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         if self._initial_pose_stamp_ns is None or pose_stamp_ns + 500_000_000 < self._initial_pose_stamp_ns:
             return False
+
+        # During recovery, an old low-covariance AMCL sample is not evidence
+        # that localization is still live.  AMCL normally publishes well
+        # within this two-second window.
+        if require_recent:
+            age_ns = self.get_clock().now().nanoseconds - pose_stamp_ns
+            if age_ns < -500_000_000 or age_ns > 2_000_000_000:
+                return False
 
         # Get covariance
         c = msg.pose.covariance
@@ -668,6 +719,7 @@ class TaskManager(Node):
         for node_name, future in self._lifecycle_futures.items():
             if future is not None and future.done():
                 self._lifecycle_futures[node_name] = None
+                query_started = self._lifecycle_query_started[node_name]
                 try:
                     state_id = future.result().current_state.id
                 except Exception as exc:
@@ -675,6 +727,8 @@ class TaskManager(Node):
                         f'[NAV2] {node_name}: lifecycle query failed: {exc}'
                     )
                     state_id = None
+
+                self._lifecycle_state_query_started[node_name] = query_started
 
                 if self._lifecycle_states[node_name] != state_id:
                     self._lifecycle_states[node_name] = state_id
@@ -695,18 +749,25 @@ class TaskManager(Node):
                     self.get_logger().info(f'[NAV2] {node_name}: service unavailable')
                 continue
             try:
+                self._lifecycle_query_started[node_name] = now
                 self._lifecycle_futures[node_name] = client.call_async(GetState.Request())
             except Exception as exc:
                 self.get_logger().warn(
                     f'[NAV2] {node_name}: unable to request lifecycle state: {exc}'
                 )
 
-    def _nav2_lifecycle_ready(self, now):
+    def _nav2_lifecycle_ready(self, now, fresh_since=None):
         """Return True only after every required navigation node is ACTIVE."""
         self._refresh_lifecycle_states(now)
         inactive = [
             node_name for node_name, state_id in self._lifecycle_states.items()
-            if state_id != LifecycleState.PRIMARY_STATE_ACTIVE
+            if (
+                state_id != LifecycleState.PRIMARY_STATE_ACTIVE
+                or (
+                    fresh_since is not None
+                    and self._lifecycle_state_query_started[node_name] < fresh_since
+                )
+            )
         ]
         if not inactive:
             return True
@@ -724,9 +785,240 @@ class TaskManager(Node):
             self._last_lifecycle_wait_log = now
         return False
 
+    def _begin_recovery_check(self, now):
+        """Require new lifecycle replies before declaring recovery ready."""
+        self._recovery_check_started_at = now
+        self._last_lifecycle_refresh = float('-inf')
+        for node_name in self._lifecycle_states:
+            self._lifecycle_states[node_name] = None
+            self._lifecycle_state_query_started[node_name] = float('-inf')
+        self._set_state(
+            TaskState.RECOVERY_CHECK,
+            self._param('recovery_readiness_timeout_seconds')
+        )
+        self.get_logger().info('[RECOVERY] Checking Nav2 readiness')
+
+    def _recovery_ready(self, now):
+        """Check every live dependency required before a retry submission."""
+        if not self.client.wait_for_server(timeout_sec=0.0):
+            return False
+        if not self._nav2_lifecycle_ready(
+            now, fresh_since=self._recovery_check_started_at
+        ):
+            return False
+        if not self._localization_ready(require_recent=True):
+            return False
+        if not self._odometry_tf_ready():
+            return False
+        return True
+
     # ========================================================
     # 10. FAILURE HANDLING
     # ========================================================
+
+    def _clear_attempt(self, attempt_id=None):
+        """Forget an attempt only after every action operation is settled."""
+        if attempt_id is not None and attempt_id != self._active_attempt_id:
+            return
+        self.goal_handle = None
+        self.goal_pending = False
+        self._goal_send_future = None
+        self._goal_result_future = None
+        self._cancel_future = None
+        self._goal_terminal = False
+        self._cancel_for_retry = False
+        self._cancel_reason = None
+        self._cancel_result_status = None
+        self._active_attempt_id = None
+
+    def _schedule_navigation_retry(self, reason, retry_delay=None):
+        """Schedule, but do not yet submit, another attempt at this waypoint."""
+        maximum = int(self._param('max_navigation_retries'))
+        if self._navigation_retries >= maximum:
+            self.get_logger().error(
+                f'[RECOVERY] Goal {self.current_goal_label} failed after '
+                f'{self._goal_attempts} attempts'
+            )
+            self.get_logger().error('[RECOVERY] Retry limit reached')
+            self.get_logger().error(
+                f'[TASK] Waypoint {self.current_goal_label} incomplete'
+            )
+            self._fail(reason)
+            return
+
+        delay = (
+            self._param('retry_delay_seconds')
+            if retry_delay is None else retry_delay
+        )
+        now = self._now()
+        if (
+            self._overall_deadline is not None
+            and now + delay >= self._overall_deadline
+        ):
+            self._fail(
+                'Overall task limit leaves insufficient time for another retry'
+            )
+            return
+
+        self._recovery_reason = reason
+        self._goal_retry_at = now + delay
+        self._set_state(TaskState.RECOVERY_WAIT)
+        self.get_logger().warn(
+            f'[RECOVERY] Scheduling retry {self._navigation_retries + 1}/'
+            f'{maximum} for goal {self.current_goal_label}: {reason}'
+        )
+        self.get_logger().info(f'[RECOVERY] Waiting {delay:.1f} seconds')
+
+    def _handle_navigation_failure(
+        self, reason, retryable=True, attempt_id=None, retry_delay=None
+    ):
+        """Centralize navigation failure classification and safe recovery."""
+        if self.state in (TaskState.COMPLETED, TaskState.FAILED):
+            return
+        if self._shutdown_requested or not retryable:
+            self._fail(reason)
+            return
+        if (
+            attempt_id is not None
+            and attempt_id != self._active_attempt_id
+        ):
+            self.get_logger().warn(
+                f'[NAV] Ignoring failure from stale attempt {attempt_id}: {reason}'
+            )
+            return
+
+        # An unresolved send, accepted goal, result, or cancellation must be
+        # reconciled before a replacement can be submitted.
+        send_unresolved = (
+            self.goal_pending
+            or (
+                self._goal_send_future is not None
+                and not self._goal_send_future.done()
+            )
+        )
+        result_unresolved = (
+            self._goal_result_future is not None
+            and not self._goal_result_future.done()
+        )
+        cancel_unresolved = (
+            self._cancel_future is not None
+            and not self._cancel_future.done()
+        )
+        accepted_active = (
+            self.goal_handle is not None
+            and self.goal_handle.accepted
+            and not self._goal_terminal
+        )
+        if send_unresolved or result_unresolved or cancel_unresolved or accepted_active:
+            self._begin_cancellation(reason, for_retry=True)
+            return
+
+        completed_attempt = self._active_attempt_id
+        self._clear_attempt(completed_attempt)
+        self._schedule_navigation_retry(reason, retry_delay=retry_delay)
+
+    def _register_result_callback(self, attempt_id):
+        """Request a terminal result for the accepted current attempt."""
+        try:
+            self._goal_result_future = self.goal_handle.get_result_async()
+            self._goal_result_future.add_done_callback(
+                lambda future, aid=attempt_id: self._goal_result(future, aid)
+            )
+        except Exception as exc:
+            self._goal_result_future = None
+            self.get_logger().warn(
+                f'[NAV] Unable to request goal result: {exc}'
+            )
+            return False
+        return True
+
+    def _issue_cancel_request(self, attempt_id):
+        """Asynchronously request cancellation of an accepted current goal."""
+        if attempt_id != self._active_attempt_id or self._cancel_future is not None:
+            return
+        try:
+            self._cancel_future = self.goal_handle.cancel_goal_async()
+            self._cancel_future.add_done_callback(
+                lambda future, aid=attempt_id: self._cancel_response(future, aid)
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f'[NAV] Unable to request cancellation: {exc}'
+            )
+            # The old goal may still be active.  Creating a replacement would
+            # be unsafe, so this is terminal even when recovery was intended.
+            self._terminal_failure_reason = self._cancel_reason
+            self._set_state(TaskState.FAILED)
+
+    def _begin_cancellation(self, reason, for_retry):
+        """Cancel for recovery or terminal failure without conflating them."""
+        attempt_id = self._active_attempt_id
+        self.stop()
+        self._cancel_for_retry = for_retry
+        self._cancel_reason = reason
+        self._cancel_result_status = None
+        self._set_state(
+            TaskState.RECOVERY_CANCEL if for_retry else TaskState.CANCELLING,
+            self._param('cancellation_timeout_seconds')
+        )
+
+        if self.goal_pending:
+            self.get_logger().warn(
+                '[NAV] Acceptance timed out; waiting for the outstanding '
+                'goal response before cancellation'
+            )
+            return
+
+        if self.goal_handle is None or not self.goal_handle.accepted:
+            self._goal_terminal = True
+            self._maybe_finish_cancellation(attempt_id)
+            return
+
+        if self._goal_result_future is None or self._goal_result_future.done():
+            self._register_result_callback(attempt_id)
+        self._issue_cancel_request(attempt_id)
+
+    def _cancel_response(self, future, attempt_id):
+        """Record cancel acknowledgment; terminal result is still required."""
+        if attempt_id != self._active_attempt_id:
+            return
+        self._cancel_future = None
+        try:
+            response = future.result()
+            if not response.goals_canceling:
+                self.get_logger().warn(
+                    '[NAV] Cancellation response contained no canceling goal; '
+                    'waiting for terminal result'
+                )
+        except Exception as exc:
+            self.get_logger().warn(
+                f'[NAV] Cancellation acknowledgment failed: {exc}; '
+                'waiting for terminal result'
+            )
+        self._maybe_finish_cancellation(attempt_id)
+
+    def _maybe_finish_cancellation(self, attempt_id):
+        """Finish cancellation only after acknowledgment and terminal result."""
+        if attempt_id != self._active_attempt_id:
+            return
+        if not self._goal_terminal or self._cancel_future is not None:
+            return
+
+        status = self._cancel_result_status
+        reason = self._cancel_reason
+        retry = self._cancel_for_retry
+        self._clear_attempt(attempt_id)
+
+        if not retry:
+            self._set_state(TaskState.FAILED)
+            return
+
+        # A timeout can race with a legitimate success.  A verified terminal
+        # success advances normally instead of replaying the waypoint.
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self._finish_goal_success()
+            return
+        self._schedule_navigation_retry(reason)
 
     def _fail(self, reason):
         """
@@ -738,34 +1030,29 @@ class TaskManager(Node):
         4. Enter FAILED state.
         """
 
-        # Do nothing if task already ended
-        if self.state in (
-            TaskState.FAILED,
-            TaskState.COMPLETED
-        ):
+        if self.state in (TaskState.FAILED, TaskState.COMPLETED):
+            return
+        if self.state is TaskState.CANCELLING:
             return
 
-        # Print failure reason
-        self.get_logger().error(reason)
-
-        # Request robot stop
+        self._terminal_failure_reason = reason
+        self.get_logger().error(f'[TASK] {reason}')
+        self.get_logger().error('[TASK] Stopping safely')
         self.stop()
-
-        # If an accepted navigation goal exists,
-        # request cancellation from Nav2.
-        if self.goal_handle is not None and self.goal_handle.accepted:
-
-            self.goal_handle.cancel_goal_async()
-
-            self._set_state(
-                TaskState.CANCELLING,
-                self._param('cancellation_timeout_seconds')
+        unresolved = (
+            self.goal_pending
+            or self._cancel_future is not None
+            or (
+                self.goal_handle is not None
+                and self.goal_handle.accepted
+                and not self._goal_terminal
             )
-
-        else:
-
-            # No accepted goal: fail immediately
-            self._set_state(TaskState.FAILED)
+        )
+        if unresolved:
+            self._begin_cancellation(reason, for_retry=False)
+            return
+        self._clear_attempt(self._active_attempt_id)
+        self._set_state(TaskState.FAILED)
 
     # ========================================================
     # 11. SEND NEXT NAVIGATION GOAL
@@ -784,122 +1071,141 @@ class TaskManager(Node):
             goal_index = 3 -> X
         """
 
-        # ----------------------------------------------------
-        # A. Check whether all four targets are complete
-        # ----------------------------------------------------
-
         if self.goal_index >= len(self.task['targets']):
-
-            # All targets completed
             self.stop()
-
-            self._set_state(
-                TaskState.COMPLETED
-            )
-
-            self.get_logger().info(
-                'Four-target task complete; robot stopped.'
-            )
-
+            self._set_state(TaskState.COMPLETED)
+            self.get_logger().info('[TASK] Four-target task complete; robot stopped')
             return
 
-        # ----------------------------------------------------
-        # B. Get current target
-        # ----------------------------------------------------
+        # A new submission is forbidden while any operation from the previous
+        # generation is unresolved.
+        if (
+            self._active_attempt_id is not None
+            or self.goal_pending
+            or self._cancel_future is not None
+        ):
+            self._fail('Internal safety check prevented overlapping navigation goals')
+            return
+        if self._overall_deadline is not None and self._now() >= self._overall_deadline:
+            self._fail('Overall task limit expired before goal submission')
+            return
 
-        # Read current landmark from task.yaml
-        self.current_goal_label = (
-            self.task['targets'][self.goal_index]
-        )
-
-        # Convert landmark label into map coordinates
-        x, y = self.converter.coordinate(
-            self.current_goal_label
-        )
-
-        # Save target coordinates for later verification
+        self.current_goal_label = self.task['targets'][self.goal_index]
+        try:
+            x, y = self.converter.coordinate(self.current_goal_label)
+            x, y = float(x), float(y)
+        except Exception as exc:
+            self._handle_navigation_failure(
+                f'Invalid waypoint {self.current_goal_label}: {exc}',
+                retryable=False
+            )
+            return
+        if not (math.isfinite(x) and math.isfinite(y)):
+            self._handle_navigation_failure(
+                f'Invalid waypoint coordinates for {self.current_goal_label}',
+                retryable=False
+            )
+            return
         self.goal_target = (x, y)
 
-        # ----------------------------------------------------
-        # C. Determine desired target orientation
-        # ----------------------------------------------------
-
         if self._param('goal_orientation') == 'start_bearing':
-
             yaw = self.converter.bearing_yaw(
                 self.task['start']['bearing']
             )
-
         elif self._param('goal_orientation') == 'none':
-
             yaw = 0.0
-
         else:
-
-            self._fail('goal_orientation must be none or start_bearing')
+            self._handle_navigation_failure(
+                'goal_orientation must be none or start_bearing',
+                retryable=False
+            )
             return
 
-        # ----------------------------------------------------
-        # D. Create Nav2 navigation goal
-        # ----------------------------------------------------
+        if not self.client.wait_for_server(timeout_sec=0.0):
+            self._handle_navigation_failure(
+                'NavigateToPose action server temporarily unavailable'
+            )
+            return
 
         goal = NavigateToPose.Goal()
-
         goal.pose = PoseStamped()
-
-        # Target coordinates are in map frame
         goal.pose.header.frame_id = 'map'
-
         goal.pose.header.stamp = self.get_clock().now().to_msg()
-
-        # Set target position
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
-
-        # Set target orientation
         goal.pose.pose.orientation.z = math.sin(yaw / 2)
         goal.pose.pose.orientation.w = math.cos(yaw / 2)
 
-        # ----------------------------------------------------
-        # E. Send goal to Nav2
-        # ----------------------------------------------------
+        if self._goal_attempts > 0:
+            maximum = int(self._param('max_navigation_retries'))
+            if self._navigation_retries >= maximum:
+                self._fail(f'Retry limit reached for goal {self.current_goal_label}')
+                return
+            self._navigation_retries += 1
 
-        # Mark goal as waiting for acceptance
+        self._next_attempt_id += 1
+        attempt_id = self._next_attempt_id
+        self._active_attempt_id = attempt_id
         self.goal_pending = True
+        self._goal_terminal = False
         self._goal_attempts += 1
-
-        # Enter NAVIGATING state with acceptance timeout
         self._set_state(
             TaskState.NAVIGATING,
             self._param('goal_acceptance_timeout_seconds')
         )
 
-        # MAIN COMMUNICATION WITH NAV2
-        #
-        # TaskManager -> NavigateToPose -> Nav2 BT Navigator
-        #
-        # Nav2 performs navigation asynchronously.
-        #
-        # When Nav2 responds to the goal request,
-        # _goal_response() will execute.
+        try:
+            self._goal_send_future = self.client.send_goal_async(goal)
+            self._goal_send_future.add_done_callback(
+                lambda future, aid=attempt_id: self._goal_response(future, aid)
+            )
+        except Exception as exc:
+            self.goal_pending = False
+            self._goal_terminal = True
+            self._handle_navigation_failure(
+                f'Goal submission failed: {exc}', attempt_id=attempt_id
+            )
+            return
 
-        self.client.send_goal_async(
-            goal
-        ).add_done_callback(
-            self._goal_response
-        )
-
-        # Print current navigation target
+        total = int(self._param('max_navigation_retries')) + 1
+        verb = 'Resending' if self._goal_attempts > 1 else 'Sending'
         self.get_logger().info(
-            f'Sending target {self.goal_index + 1}/4: '
-            f'{self.current_goal_label} ({x:.3f}, {y:.3f})'
+            f'[NAV] {verb} goal {self.current_goal_label} '
+            f'({x:.3f}, {y:.3f}), attempt {self._goal_attempts}/{total}'
         )
 
     # ========================================================
     # 12. NAV2 GOAL ACCEPTANCE CALLBACK
     # ========================================================
 
-    def _goal_response(self, future):
+    def _account_for_stale_goal_response(self, future, attempt_id):
+        """Cancel and retain any goal accepted by a stale send callback."""
+        try:
+            handle = future.result()
+        except Exception as exc:
+            self.get_logger().warn(
+                f'[NAV] Stale attempt {attempt_id} response failed: {exc}'
+            )
+            return
+        if handle is None or not handle.accepted:
+            return
+
+        self.get_logger().error(
+            f'[NAV] Late acceptance for stale attempt {attempt_id}; canceling it'
+        )
+        self._stale_goal_handles[attempt_id] = handle
+        try:
+            handle.get_result_async().add_done_callback(
+                lambda _future, aid=attempt_id:
+                self._stale_goal_handles.pop(aid, None)
+            )
+            handle.cancel_goal_async()
+        except Exception as exc:
+            self.get_logger().error(
+                f'[NAV] Unable to reconcile stale attempt {attempt_id}: {exc}'
+            )
+
+    def _goal_response(self, future, attempt_id):
         """
         Triggered when Nav2 responds to the goal request.
 
@@ -908,89 +1214,99 @@ class TaskManager(Node):
         It only means Nav2 accepted or rejected the goal.
         """
 
-        # Ignore response if task is no longer waiting
-        if (
-            self.state is not TaskState.NAVIGATING
-            or not self.goal_pending
-        ):
+        if attempt_id != self._active_attempt_id:
+            self._account_for_stale_goal_response(future, attempt_id)
             return
 
-        # Goal request is no longer pending
         self.goal_pending = False
+        self._goal_send_future = None
 
-        # Read Nav2 goal handle
         try:
-
             self.goal_handle = future.result()
-
         except Exception as exc:
-
-            self._fail(
-                f'Goal request failed: {exc}'
-            )
+            self._goal_terminal = True
+            if self.state in (TaskState.RECOVERY_CANCEL, TaskState.CANCELLING):
+                self._maybe_finish_cancellation(attempt_id)
+            else:
+                self._handle_navigation_failure(
+                    f'Goal request failed: {exc}', attempt_id=attempt_id
+                )
             return
 
-        # Check whether Nav2 accepted the goal
-        if (
-            self.goal_handle is None
-            or not self.goal_handle.accepted
-        ):
-            # A rejected response can contain a non-None handle.  It is not
-            # an active goal and must never be passed to cancellation logic.
+        if self.goal_handle is None or not self.goal_handle.accepted:
             self.goal_handle = None
-            retries = self._param('startup_goal_retries')
-            # Only the first target can plausibly race Nav2's startup.  A
-            # rejection later in the mission is a navigation failure, not a
-            # reason to replay an already-running mission step.
-            if self.goal_index == 0 and self._goal_attempts <= retries:
-                self._goal_retry_at = (
-                    self._now()
-                    + self._param('startup_goal_retry_delay_seconds')
-                )
-                # Do not decide the retry using the state snapshot that
-                # preceded the rejected request.
-                for node_name in self._lifecycle_states:
-                    self._lifecycle_states[node_name] = None
-                self._last_lifecycle_refresh = float('-inf')
-                self.get_logger().warn(
-                    f'[NAV] Target {self.goal_index + 1}/4 '
-                    f'{self.current_goal_label} rejected before execution; '
-                    f'rechecking Nav2 lifecycle before retry '
-                    f'{self._goal_attempts}/{retries}'
-                )
-                self._set_state(
-                    TaskState.WAITING_FOR_NAV2_LIFECYCLE,
-                    self._param('nav2_activation_timeout_seconds')
-                )
+            self._goal_terminal = True
+            reason = f'Nav2 rejected goal {self.current_goal_label}'
+            self.get_logger().warn(f'[NAV] {reason}')
+            if self.state in (TaskState.RECOVERY_CANCEL, TaskState.CANCELLING):
+                self._cancel_reason = self._cancel_reason or reason
+                self._maybe_finish_cancellation(attempt_id)
                 return
 
-            self._fail(
-                f'Nav2 rejected target {self.goal_index + 1}/4 '
-                f'{self.current_goal_label} after {self._goal_attempts} attempts'
+            startup_delay = None
+            if (
+                self.goal_index == 0
+                and self._goal_attempts <= int(self._param('startup_goal_retries'))
+            ):
+                startup_delay = self._param('startup_goal_retry_delay_seconds')
+            self._handle_navigation_failure(
+                reason,
+                attempt_id=attempt_id,
+                retry_delay=startup_delay
             )
             return
 
-        # Nav2 accepted the goal.
-        # Start navigation execution timeout.
-        self._state_deadline = (
-            self._now()
-            + self._param('navigation_timeout_seconds')
+        self.get_logger().info(
+            f'[NAV] Goal {self.current_goal_label} accepted, attempt '
+            f'{self._goal_attempts}/{int(self._param("max_navigation_retries")) + 1}'
         )
-
-        # Register callback for FINAL navigation result.
-        #
-        # When Nav2 finishes navigating,
-        # ROS executes _goal_result().
-
-        self.goal_handle.get_result_async().add_done_callback(
-            self._goal_result
-        )
+        result_registered = self._register_result_callback(attempt_id)
+        if self.state in (TaskState.RECOVERY_CANCEL, TaskState.CANCELLING):
+            self._issue_cancel_request(attempt_id)
+            return
+        if not result_registered:
+            self._handle_navigation_failure(
+                'Unable to retrieve goal result', attempt_id=attempt_id
+            )
+            return
+        if self.state is not TaskState.NAVIGATING:
+            self._begin_cancellation(
+                'Goal accepted after task left navigation state', for_retry=False
+            )
+            return
+        self._state_deadline = self._now() + self._param('navigation_timeout_seconds')
 
     # ========================================================
     # 13. NAV2 NAVIGATION RESULT CALLBACK
     # ========================================================
 
-    def _goal_result(self, future):
+    def _finish_goal_success(self):
+        """Verify Nav2 success before entering the existing dwell phase."""
+        if self._overall_deadline is not None and self._now() >= self._overall_deadline:
+            self._fail('Overall task limit expired before success verification')
+            return
+        p = (
+            self._last_amcl_pose.pose.pose.position
+            if self._last_amcl_pose is not None else None
+        )
+        if (
+            p is None
+            or math.hypot(
+                p.x - self.goal_target[0], p.y - self.goal_target[1]
+            ) > self._param('goal_xy_tolerance')
+        ):
+            self._handle_navigation_failure(
+                'Nav2 reported success outside target tolerance'
+            )
+            return
+
+        self.get_logger().info(f'[NAV] Goal {self.current_goal_label} succeeded')
+        self.get_logger().info(f'[TASK] Dwell at {self.current_goal_label}')
+        self.stop()
+        self._dwell_deadline = None
+        self._set_state(TaskState.DWELLING)
+
+    def _goal_result(self, future, attempt_id):
         """
         Triggered when Nav2 finishes navigation.
 
@@ -1000,81 +1316,58 @@ class TaskManager(Node):
         - CANCELED
         """
 
-        # Only process results during navigation/cancellation
-        if self.state not in (
-            TaskState.NAVIGATING,
-            TaskState.CANCELLING
-        ):
+        if attempt_id != self._active_attempt_id:
+            self._stale_goal_handles.pop(attempt_id, None)
             return
 
-        # Clear active goal handle
+        try:
+            status = future.result().status
+        except Exception as exc:
+            self._goal_result_future = None
+            if self.state in (TaskState.RECOVERY_CANCEL, TaskState.CANCELLING):
+                self.get_logger().warn(
+                    f'[NAV] Goal result unavailable during cancellation: {exc}'
+                )
+                return
+            self._handle_navigation_failure(
+                f'Goal result failed: {exc}', attempt_id=attempt_id
+            )
+            return
+
+        self._goal_result_future = None
+        self._goal_terminal = True
+        self._cancel_result_status = status
         self.goal_handle = None
 
-        # Read Nav2 result status
-        try:
+        # A result arriving after a terminal decision is accounted for, but
+        # can neither revive the mission nor schedule recovery.
+        if self.state in (TaskState.FAILED, TaskState.COMPLETED):
+            self._clear_attempt(attempt_id)
+            return
 
-            status = future.result().status
+        if self.state in (TaskState.RECOVERY_CANCEL, TaskState.CANCELLING):
+            self._maybe_finish_cancellation(attempt_id)
+            return
 
-        except Exception as exc:
-
-            self._fail(
-                f'Goal result failed: {exc}'
+        self._clear_attempt(attempt_id)
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self._finish_goal_success()
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().warn(f'[NAV] Goal {self.current_goal_label} aborted')
+            self._handle_navigation_failure(
+                f'Goal {self.current_goal_label} aborted'
             )
-            return
-
-        # If cancellation was requested, ignore normal result
-        if self.state is TaskState.CANCELLING:
-            return
-
-        # Check whether navigation succeeded
-        if status != GoalStatus.STATUS_SUCCEEDED:
-
-            self._fail(
-                f'Navigation failed with action status {status}'
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().warn(
+                f'[NAV] Goal {self.current_goal_label} canceled unexpectedly'
             )
-            return
-
-        # ----------------------------------------------------
-        # A. Verify robot reached target
-        # ----------------------------------------------------
-
-        # Get latest AMCL estimated position
-        if self._last_amcl_pose is not None:
-
-            p = self._last_amcl_pose.pose.pose.position
-
+            self._handle_navigation_failure(
+                f'Goal {self.current_goal_label} canceled unexpectedly'
+            )
         else:
-
-            p = None
-
-        # Check distance from robot to target
-        if (
-            p is None
-            or math.hypot(
-                p.x - self.goal_target[0],
-                p.y - self.goal_target[1]
-            ) > self._param('goal_xy_tolerance')
-        ):
-
-            self._fail(
-                'Nav2 reported success outside target tolerance'
+            self._handle_navigation_failure(
+                f'Navigation returned unexpected action status {status}'
             )
-            return
-
-        # ----------------------------------------------------
-        # B. Navigation succeeded
-        # ----------------------------------------------------
-
-        # Request robot stop
-        self.stop()
-
-        # Reset dwell timer
-        self._dwell_deadline = None
-
-        # Enter DWELLING state
-        self._set_state(
-            TaskState.DWELLING
-        )
 
     # ========================================================
     # 14. MAIN TIMER CALLBACK — TASK STATE MACHINE
@@ -1106,6 +1399,9 @@ class TaskManager(Node):
         if self.state in (
             TaskState.FAILED,
             TaskState.COMPLETED,
+            TaskState.RECOVERY_WAIT,
+            TaskState.RECOVERY_CHECK,
+            TaskState.RECOVERY_CANCEL,
             TaskState.CANCELLING,
             TaskState.DWELLING
         ):
@@ -1128,7 +1424,8 @@ class TaskManager(Node):
             and now >= self._overall_deadline
             and self.state not in (
                 TaskState.COMPLETED,
-                TaskState.FAILED
+                TaskState.FAILED,
+                TaskState.CANCELLING
             )
         ):
 
@@ -1230,10 +1527,6 @@ class TaskManager(Node):
             if not self._nav2_lifecycle_ready(now):
                 return
 
-            if self._goal_retry_at is not None and now < self._goal_retry_at:
-                return
-
-            self._goal_retry_at = None
             self.get_logger().info('[NAV2] All required navigation nodes ACTIVE')
             self._send_next_goal()
 
@@ -1243,15 +1536,50 @@ class TaskManager(Node):
 
         elif self.state is TaskState.NAVIGATING:
 
-            # Check navigation timeout
             if now >= self._state_deadline:
-
-                self._fail(
-                    'Navigation goal acceptance or execution timeout'
+                reason = (
+                    'Navigation goal acceptance timeout'
+                    if self.goal_pending
+                    else 'Navigation execution timeout'
+                )
+                self._handle_navigation_failure(
+                    reason, attempt_id=self._active_attempt_id
                 )
 
         # ----------------------------------------------------
-        # H. STATE: CANCELLING
+        # H. STATES: RECOVERY WAIT / READINESS / CANCELLATION
+        # ----------------------------------------------------
+
+        elif self.state is TaskState.RECOVERY_WAIT:
+
+            if now >= self._goal_retry_at:
+                self._begin_recovery_check(now)
+
+        elif self.state is TaskState.RECOVERY_CHECK:
+
+            if self._recovery_ready(now):
+                self.get_logger().info('[RECOVERY] Nav2 ready')
+                self._goal_retry_at = None
+                self._send_next_goal()
+                return
+            if now >= self._state_deadline:
+                self._fail(
+                    'Recovery readiness timeout; Nav2, TF, or localization '
+                    'did not become ready'
+                )
+
+        elif self.state is TaskState.RECOVERY_CANCEL:
+
+            if now >= self._state_deadline:
+                self.get_logger().error(
+                    '[RECOVERY] Cancellation timeout; old goal status is '
+                    'ambiguous, so no replacement goal will be sent'
+                )
+                self._terminal_failure_reason = 'Recovery cancellation timeout'
+                self._set_state(TaskState.FAILED)
+
+        # ----------------------------------------------------
+        # I. STATE: TERMINAL CANCELLING
         # ----------------------------------------------------
 
         elif self.state is TaskState.CANCELLING:
@@ -1260,7 +1588,8 @@ class TaskManager(Node):
             if now >= self._state_deadline:
 
                 self.get_logger().error(
-                    'Cancellation timeout; command stop remains active'
+                    '[TASK] Terminal cancellation timeout; command stop '
+                    'remains active'
                 )
 
                 self._set_state(
@@ -1268,7 +1597,7 @@ class TaskManager(Node):
                 )
 
         # ----------------------------------------------------
-        # I. STATE: DWELLING
+        # J. STATE: DWELLING
         # ----------------------------------------------------
 
         elif self.state is TaskState.DWELLING:
@@ -1292,6 +1621,13 @@ class TaskManager(Node):
                 # Move to next target index
                 self.goal_index += 1
                 self._goal_attempts = 0
+                self._navigation_retries = 0
+
+                if self.goal_index < len(self.task['targets']):
+                    self.get_logger().info(
+                        f'[TASK] Continuing to '
+                        f'{self.task["targets"][self.goal_index]}'
+                    )
 
                 # Send next goal or finish mission
                 self._send_next_goal()
@@ -1326,6 +1662,10 @@ def main():
         rclpy.spin(node)
 
     finally:
+
+        # Any callback that happens to be queued during shutdown is terminal
+        # and must never schedule recovery.
+        node._shutdown_requested = True
 
         # Request robot stop before shutdown
         node.stop()

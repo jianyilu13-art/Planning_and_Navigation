@@ -28,8 +28,8 @@ amcl:
     max_beams: 60
 
     # Laser measurement probabilities
-    z_hit: 0.8  # Gives substantial weight to laser measurements that match mapped obstacles.
-    z_rand: 0.2  # Allows some tolerance for unexpected measurements
+    z_hit: 0.9  # Gives substantial weight to laser measurements that match mapped obstacles.
+    z_rand: 0.1  # Allows some tolerance for unexpected measurements
     sigma_hit: 0.2  # Controls the width of the laser endpoint matching distribution.
     laser_likelihood_max_dist: 2.0
 
@@ -83,7 +83,7 @@ controller_server:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
 
       # ===== Forward Movement =====
-      desired_linear_vel: 0.3                # Desired forward speed (m/s)
+      desired_linear_vel: 0.27                # Desired forward speed (m/s)
 
       # ===== Path Following =====
       lookahead_dist: 0.3                    # Fixed lookahead distance (m)
@@ -123,11 +123,15 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 6
-      height: 6
-      resolution: 0.03
+      width: 2
+      height: 2
+      resolution: 0.04
+
+      update_frequency: 5.0
+      publish_frequency: 2.0
+
       # Supplied URDF chassis is 0.30 x 0.25 m; retain a small physical margin.
-      footprint: "[[-0.09, -0.08], [0.09, -0.08], [0.09, 0.08], [-0.09, 0.08]]"
+      footprint: "[[-0.095, -0.085], [0.095, -0.085], [0.095, 0.085], [-0.095, 0.085]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -163,8 +167,11 @@ global_costmap:
       use_sim_time: false
       global_frame: map
       robot_base_frame: base_link
-      resolution: 0.03
-      footprint: "[[-0.09, -0.08], [0.09, -0.08], [0.09, 0.08], [-0.09, 0.08]]"
+      resolution: 0.04
+
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      footprint: "[[-0.095, -0.085], [0.095, -0.085], [0.095, 0.085], [-0.095, 0.085]]"
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
@@ -243,8 +250,8 @@ velocity_smoother:
     use_sim_time: false
     smoothing_frequency: 20.0
     feedback: OPEN_LOOP
-    max_velocity: [0.5, 0.0, 1.0]
-    min_velocity: [-0.5, 0.0, -1.0]
+    max_velocity: [0.5, 0.0, 1.5]
+    min_velocity: [-0.5, 0.0, -1.5]
     max_accel: [1.5, 0.0, 1.5]
     max_decel: [-1.5, 0.0, -1.5]
     odom_topic: /odom
