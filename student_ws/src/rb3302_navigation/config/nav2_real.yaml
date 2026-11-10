@@ -11,7 +11,7 @@ amcl:
     # Motion model
     robot_model_type: nav2_amcl::DifferentialMotionModel
 
-    alpha1: 0.9
+    alpha1: 0.4
     alpha2: 0.3
     alpha3: 0.4
     alpha4: 0.4
@@ -35,7 +35,7 @@ amcl:
 
     # Localization updates
     update_min_d: 0.05  # These parameters determine the motion required before AMCL performs another laser-based update.
-    update_min_a: 0.05
+    update_min_a: 0.03
 
     # Particle resampling
     resample_interval: 1
@@ -76,7 +76,7 @@ controller_server:
     # (verified in nav2_controller/plugins.xml), so completion is position-only.
     goal_checker:
       plugin: nav2_controller::PositionGoalChecker
-      xy_goal_tolerance: 0.08
+      xy_goal_tolerance: 0.05
       stateful: true
 
     FollowPath:
@@ -131,7 +131,7 @@ local_costmap:
       publish_frequency: 2.0
 
       # Supplied URDF chassis is 0.30 x 0.25 m; retain a small physical margin.
-      footprint: "[[-0.095, -0.085], [0.095, -0.085], [0.095, 0.085], [-0.095, 0.085]]"
+      footprint: "[[-0.09, -0.08], [0.09, -0.08], [0.09, 0.08], [-0.09, 0.08]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -157,8 +157,8 @@ local_costmap:
           inf_is_valid: false
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        inflation_radius: 0.14
-        cost_scaling_factor: 3.0
+        inflation_radius: 0.16
+        cost_scaling_factor: 0.5
       always_send_full_costmap: true
 
 global_costmap:
@@ -171,7 +171,7 @@ global_costmap:
 
       update_frequency: 1.0
       publish_frequency: 1.0
-      footprint: "[[-0.095, -0.085], [0.095, -0.085], [0.095, 0.085], [-0.095, 0.085]]"
+      footprint: "[[-0.09, -0.08], [0.09, -0.08], [0.09, 0.08], [-0.09, 0.08]]"
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
@@ -201,8 +201,8 @@ global_costmap:
           inf_is_valid: false
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        inflation_radius: 0.14
-        cost_scaling_factor: 3.0
+        inflation_radius: 0.16
+        cost_scaling_factor: 0.5
       always_send_full_costmap: true
 
 map_server:
@@ -227,6 +227,9 @@ smoother_server:
 
 behavior_server:
   ros__parameters:
+    max_rotational_vel: 1.5
+    min_rotational_vel: 1.5
+    rotational_acc_lim: 1.5
     use_sim_time: false
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
@@ -235,6 +238,7 @@ behavior_server:
     behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
     spin:
       plugin: nav2_behaviors::Spin
+      simulate_ahead_time: 0.5
     backup:
       plugin: nav2_behaviors::BackUp
     drive_on_heading:
@@ -250,9 +254,9 @@ velocity_smoother:
     use_sim_time: false
     smoothing_frequency: 20.0
     feedback: OPEN_LOOP
-    max_velocity: [0.5, 0.0, 1.5]
-    min_velocity: [-0.5, 0.0, -1.5]
-    max_accel: [1.5, 0.0, 1.5]
+    max_velocity: [0.5, 0.0, 1.8]
+    min_velocity: [-0.5, 0.0, -1.8]
+    max_accel: [0.2, 0.0, 1.5]
     max_decel: [-1.5, 0.0, -1.5]
     odom_topic: /odom
     enable_stamped_cmd_vel: false

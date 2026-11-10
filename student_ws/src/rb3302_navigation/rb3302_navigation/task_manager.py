@@ -176,7 +176,7 @@ class TaskManager(Node):
             # additional submissions after the first attempt at a waypoint.
             'max_navigation_retries': 5,
             'retry_delay_seconds': 2.0,
-            'recovery_readiness_timeout_seconds': 10.0,
+            'recovery_readiness_timeout_seconds': 30.0,
 
             # Maximum time for the complete mission
             'overall_timeout_seconds': 300.0,
@@ -190,7 +190,7 @@ class TaskManager(Node):
             'stop_angular_tolerance': 0.05,
 
             # Maximum distance between robot and target
-            'goal_xy_tolerance': 0.15,
+            'goal_xy_tolerance': 0.08,
 
             # Do not continually reset AMCL on real hardware. Enable only for
             # a deliberate recovery experiment.
