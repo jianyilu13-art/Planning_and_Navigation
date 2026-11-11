@@ -221,7 +221,7 @@ class TaskManager(Node):
             'navigation_safety_margin_seconds': 0.0,
             'mission_time_reserve_seconds': 0.0,
             'selection_retry_limit': 1,
-            'path_estimation_timeout_seconds': 2.0,
+            'path_estimation_timeout_seconds': 10.0,
             'failure_penalty_seconds': 0.0,
             'dynamic_replan_period_seconds': 5.0,
             'dynamic_switch_confirmation_count': 2,

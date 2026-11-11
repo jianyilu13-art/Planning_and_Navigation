@@ -87,15 +87,15 @@ controller_server:
 
       # ===== Path Following =====
       lookahead_dist: 0.2                    # Fixed lookahead distance (m)
-      min_lookahead_dist: 0.2                # Minimum adaptive lookahead (m)
-      max_lookahead_dist: 0.5                # Maximum adaptive lookahead (m)
+      min_lookahead_dist: 0.16                # Minimum adaptive lookahead (m)
+      max_lookahead_dist: 0.3                # Maximum adaptive lookahead (m)
       lookahead_time: 1.5                    # Time used for adaptive lookahead (s)
       use_velocity_scaled_lookahead_dist: false  # false = use fixed lookahead_dist
 
       # ===== Turning =====
       rotate_to_heading_angular_vel: 2.0     # In-place turning speed (rad/s)
       use_rotate_to_heading: true            # Allow rotation to align with heading
-      rotate_to_heading_min_angle: 1.041     # Heading error threshold (~45°)
+      rotate_to_heading_min_angle: 1.5       # Heading error threshold (~45°)
       max_angular_accel: 2.5                 # Angular acceleration limit (rad/s²)
       allow_reversing: false                 # Do not follow paths backward
 
