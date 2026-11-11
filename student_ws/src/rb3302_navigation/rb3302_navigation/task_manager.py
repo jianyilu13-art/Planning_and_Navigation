@@ -197,8 +197,12 @@ class TaskManager(Node):
             # Accepted goals have no fixed execution timeout.  Instead,
             # require meaningful movement over this rolling interval.
             'progress_window_seconds': 35.0,
-            'near_goal_path_threshold_meters': 0.50,
+            'near_goal_path_threshold_meters': 1.0,
             'near_goal_progress_window_seconds': 50.0,
+            'very_near_goal_path_threshold_meters': 0.50,
+            'very_near_goal_progress_window_seconds': 60.0,
+            'final_approach_path_threshold_meters': 0.25,
+            'final_approach_progress_window_seconds': 75.0,
             'nav_feedback_freshness_seconds': 3.0,
             'progress_min_distance_meters': 0.10,
             'progress_min_odom_displacement_meters': 0.10,
@@ -211,7 +215,7 @@ class TaskManager(Node):
             'effective_angular_speed': 0.50,
             'significant_turn_threshold_degrees': 30.0,
             'turn_penalty_seconds': 3.0,
-            'inplace_180_turn_penalty': 22.0,
+            'inplace_180_turn_penalty': 30.0,
             'inplace_180_angle_threshold': 165.0,
             'path_simplification_tolerance': 0.03,
             'navigation_safety_margin_seconds': 0.0,
@@ -234,8 +238,8 @@ class TaskManager(Node):
             'localization_yaw_variance_limit': 0.8,
 
             # Velocity thresholds for considering robot stopped
-            'stop_linear_tolerance': 0.02,
-            'stop_angular_tolerance': 0.05,
+            'stop_linear_tolerance': 0.05,
+            'stop_angular_tolerance': 0.09,
 
             # Maximum distance between robot and target
             'goal_xy_tolerance': 0.08,
@@ -463,6 +467,7 @@ class TaskManager(Node):
         self._progress_monitor_started_at = None
         self._latest_nav_distance_remaining = None
         self._latest_nav_distance_stamp = None
+        self._near_goal_committed = False
         self._latest_feedback_position = None
         self._latest_nav_recoveries = 0
         self._last_progress_diagnostic_log = float('-inf')
@@ -1146,6 +1151,10 @@ class TaskManager(Node):
         for name in (
             'near_goal_path_threshold_meters',
             'near_goal_progress_window_seconds',
+            'very_near_goal_path_threshold_meters',
+            'very_near_goal_progress_window_seconds',
+            'final_approach_path_threshold_meters',
+            'final_approach_progress_window_seconds',
             'nav_feedback_freshness_seconds',
             'straight_speed',
             'effective_angular_speed',
@@ -1789,6 +1798,7 @@ class TaskManager(Node):
         self.goal_target = self.converter.coordinate(label)
         self._waypoint_status[label] = WaypointState.ACTIVE
         self._waypoint_started_at = self._now()
+        self._near_goal_committed = False
         self._goal_attempts = 0
         self._navigation_retries = 0
         self.get_logger().info(
@@ -1896,6 +1906,14 @@ class TaskManager(Node):
         if (best is None and len(candidates) == 1
                 and self._remaining_mission_time() > 0.0):
             return True, 'last eligible goal: retry despite time estimate'
+        # An already-approached waypoint is not discarded solely because
+        # another ordered route has a better estimated time. Retry limits,
+        # Nav2 safety, and the mission deadline still apply.
+        remaining_path = self._fresh_remaining_path(now)
+        if (self._near_goal_committed or
+                (remaining_path is not None and remaining_path <=
+                 self._param('near_goal_path_threshold_meters'))):
+            return True, 'near-goal path commitment: preserve current waypoint'
         if best is None or best[0][0] != label:
             alternative = None if best is None else best[0][0]
             return False, f'alternative target {alternative} has better time value'
@@ -2011,6 +2029,33 @@ class TaskManager(Node):
             except Exception:
                 self._dynamic_probe_finish(cycle, edge)
 
+    def _fresh_remaining_path(self, now):
+        """Use only fresh Nav2 planned-route distance, never map straight-line distance."""
+        stamp = self._latest_nav_distance_stamp
+        distance = self._latest_nav_distance_remaining
+        if stamp is None or distance is None or not math.isfinite(distance):
+            return None
+        age = now - stamp
+        if not 0.0 <= age <= self._param('nav_feedback_freshness_seconds'):
+            return None
+        return distance
+
+    def _near_goal_window(self, now):
+        """Return the current no-progress allowance for the active route."""
+        distance = self._fresh_remaining_path(now)
+        if distance is None:
+            return self._param('progress_window_seconds')
+        if distance <= self._param('final_approach_path_threshold_meters'):
+            self._near_goal_committed = True
+            return self._param('final_approach_progress_window_seconds')
+        if self._near_goal_committed:
+            return self._param('final_approach_progress_window_seconds')
+        if distance <= self._param('very_near_goal_path_threshold_meters'):
+            return self._param('very_near_goal_progress_window_seconds')
+        if distance <= self._param('near_goal_path_threshold_meters'):
+            return self._param('near_goal_progress_window_seconds')
+        return self._param('progress_window_seconds')
+
     def _dynamic_compare(self, cycle):
         if cycle != self._dynamic_cycle or self.state is not TaskState.NAVIGATING:
             return
@@ -2029,12 +2074,10 @@ class TaskManager(Node):
                for label in [active] + later):
             return
         now = self._now()
-        age = (None if self._latest_nav_distance_stamp is None else
-               now - self._latest_nav_distance_stamp)
-        if (age is not None and 0 <= age <= self._param('nav_feedback_freshness_seconds')
-                and self._latest_nav_distance_remaining is not None
-                and self._latest_nav_distance_remaining <=
-                    self._param('near_goal_path_threshold_meters')):
+        remaining_path = self._fresh_remaining_path(now)
+        if (self._near_goal_committed or
+                (remaining_path is not None and remaining_path <=
+                 self._param('near_goal_path_threshold_meters'))):
             return
         candidates = [active] + later
         coordinates = {label: self.converter.coordinate(label) for label in candidates}
@@ -2115,6 +2158,7 @@ class TaskManager(Node):
         self._progress_monitor_started_at = now
         self._latest_nav_distance_remaining = None
         self._latest_nav_distance_stamp = None
+        self._near_goal_committed = False
         self._latest_feedback_position = None
         self._latest_nav_recoveries = 0
         self._last_progress_diagnostic_log = float('-inf')
@@ -2186,16 +2230,15 @@ class TaskManager(Node):
     def _record_progress_sample(self, now):
         """Record at most four samples per second and retain one full window."""
         sample = self._progress_snapshot(now)
-        if self._progress_samples and (
-            now - self._progress_samples[-1]['time'] < 0.25
-        ):
-            self._progress_samples[-1] = sample
-        else:
+        if (not self._progress_samples or
+                now - self._progress_samples[-1]['time'] >= 0.25):
             self._progress_samples.append(sample)
 
         cutoff = now - max(
             self._param('progress_window_seconds'),
-            self._param('near_goal_progress_window_seconds')
+            self._param('near_goal_progress_window_seconds'),
+            self._param('very_near_goal_progress_window_seconds'),
+            self._param('final_approach_progress_window_seconds')
         )
         while (
             len(self._progress_samples) > 2
@@ -2234,18 +2277,7 @@ class TaskManager(Node):
         else:
             self._record_progress_sample(now)
 
-        window = self._param('progress_window_seconds')
-        nav_age = (None if self._latest_nav_distance_stamp is None else
-                   now - self._latest_nav_distance_stamp)
-        near_goal = (
-            self._latest_nav_distance_remaining is not None
-            and nav_age is not None
-            and 0.0 <= nav_age <= self._param('nav_feedback_freshness_seconds')
-            and self._latest_nav_distance_remaining <=
-                self._param('near_goal_path_threshold_meters')
-        )
-        if near_goal:
-            window = self._param('near_goal_progress_window_seconds')
+        window = self._near_goal_window(now)
         elapsed = now - self._progress_monitor_started_at
         nav_reduction = self._metric_reduction(
             self._progress_samples, 'nav_distance'
@@ -2804,27 +2836,67 @@ class TaskManager(Node):
     # ========================================================
 
     def _finish_goal_success(self):
-        """Verify Nav2 success before entering the existing dwell phase."""
-        if self._overall_deadline is not None and self._now() >= self._overall_deadline:
-            self._fail('Overall task limit expired before success verification')
-            return
-        p = (
-            self._last_amcl_pose.pose.pose.position
-            if self._last_amcl_pose is not None else None
-        )
+        """Verify Nav2 success using current TF before entering dwell."""
+
         if (
-            p is None
-            or math.hypot(
-                p.x - self.goal_target[0], p.y - self.goal_target[1]
-            ) > self._param('goal_xy_tolerance')
+            self._overall_deadline is not None
+            and self._now() >= self._overall_deadline
+        ):
+            self._fail(
+                'Overall task limit expired before success verification'
+            )
+            return
+
+        # Nav2 has already reported SUCCESS.
+        # Use the current map-frame robot pose rather than stale AMCL data.
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map',
+                'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0)
+            )
+
+            x = transform.transform.translation.x
+            y = transform.transform.translation.y
+
+            distance = math.hypot(
+                x - self.goal_target[0],
+                y - self.goal_target[1]
+            )
+
+        except Exception as exc:
+            self.get_logger().warn(
+                f'[NAV] Unable to verify current TF after Nav2 success: {exc}'
+            )
+            self._handle_navigation_failure(
+                'Current TF unavailable after Nav2 success'
+            )
+            return
+
+        self.get_logger().info(
+            f'[NAV] Goal {self.current_goal_label} success verification: '
+            f'distance={distance:.3f}m, '
+            f'tolerance={self._param("goal_xy_tolerance"):.3f}m'
+        )
+
+        if (
+            not math.isfinite(distance)
+            or distance > self._param('goal_xy_tolerance')
         ):
             self._handle_navigation_failure(
                 'Nav2 reported success outside target tolerance'
             )
             return
 
-        self.get_logger().info(f'[NAV] Goal {self.current_goal_label} succeeded')
-        self.get_logger().info(f'[TASK] Dwell at {self.current_goal_label}')
+        self.get_logger().info(
+            f'[NAV] Goal {self.current_goal_label} succeeded'
+        )
+
+        self.get_logger().info(
+            f'[TASK] Dwell at {self.current_goal_label}'
+        )
+
         self.stop()
         self._dwell_deadline = None
         self._set_state(TaskState.DWELLING)
