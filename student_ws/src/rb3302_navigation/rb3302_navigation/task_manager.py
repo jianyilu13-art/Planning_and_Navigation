@@ -47,6 +47,7 @@ from nav2_msgs.action import ComputePathToPose, NavigateToPose
 
 # Robot odometry message
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 
 # ROS 2 action client and node
 from rclpy.action import ActionClient
@@ -226,6 +227,8 @@ class TaskManager(Node):
             'path_estimation_timeout_seconds': 10.0,
             'internal_map_yaml': '/home/ubuntu/rb3302_final_proj_code/student_ws/maps/rb3302_map.yaml',
             'internal_astar_clearance_m': 0.11,
+            'memory_square_size_m': 0.60,
+            'memory_scan_max_distance_m': 0.90,
             'failure_penalty_seconds': 0.0,
             'dynamic_replan_period_seconds': 5.0,
             'dynamic_switch_confirmation_count': 2,
@@ -261,6 +264,12 @@ class TaskManager(Node):
 
         self._internal_grid = None
         self._internal_grid_error = None
+        self._memory_squares = []  # RAM only; never written to map files
+        self._memory_blocked_cells = set()
+        self._memory_scan_candidate = None
+        self._memory_scan_confirmations = 0
+        self._memory_scan_stamp = None
+        self._memory_last_recoveries = 0
 
         # ----------------------------------------------------
         # B. Create ROS publishers
@@ -378,6 +387,9 @@ class TaskManager(Node):
             10
         )
 
+        # Latest LiDAR evidence is used ONLY by the estimator memory.
+        self.create_subscription(LaserScan, '/scan', self._memory_scan_cb, 10)
+
         # ----------------------------------------------------
         # E. Create TF listener
         # ----------------------------------------------------
@@ -481,6 +493,9 @@ class TaskManager(Node):
         self._near_goal_committed = False
         self._latest_feedback_position = None
         self._latest_nav_recoveries = 0
+        self._memory_last_recoveries = 0
+        self._memory_scan_candidate = None
+        self._memory_scan_confirmations = 0
         self._last_progress_diagnostic_log = float('-inf')
 
         # Current landmark label, e.g. "G"
@@ -1429,11 +1444,117 @@ class TaskManager(Node):
             self.get_logger().error(f'[ESTIMATOR] Internal A* unavailable: {exc}')
             return False
 
+    # ========================================================
+    # TEMPORARY OBSTACLE MEMORY - ESTIMATOR ONLY
+    # ========================================================
+
+    def _memory_scan_cb(self, msg):
+        """Find a repeatedly observed, unmapped obstacle near the robot.
+
+        This callback does not alter Nav2, send goals, or change any map file.
+        A square is committed only when Nav2 reports a NEW recovery.
+        """
+        if self.state is not TaskState.NAVIGATING or not self._load_internal_grid():
+            self._memory_scan_candidate = None
+            self._memory_scan_confirmations = 0
+            return
+        if not msg.ranges or msg.angle_increment == 0.0:
+            return
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', msg.header.frame_id, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0))
+        except Exception:
+            return
+        q = transform.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        tx = transform.transform.translation.x
+        ty = transform.transform.translation.y
+        width, height, resolution, ox, oy, static_blocked = self._internal_grid
+        # Cluster LiDAR returns in 12-cm bins. Ignore mapped walls and
+        # the inflated margin around them to avoid false discoveries.
+        clusters = {}
+        for i, raw in enumerate(msg.ranges):
+            r = float(raw)
+            if not math.isfinite(r) or r < max(0.12, msg.range_min):
+                continue
+            if r > min(float(msg.range_max), self._param('memory_scan_max_distance_m')):
+                continue
+            angle = msg.angle_min + i * msg.angle_increment
+            if abs(self._normalize_angle(angle)) > math.radians(55.0):
+                continue
+            world_angle = yaw + angle
+            x = tx + r * math.cos(world_angle)
+            y = ty + r * math.sin(world_angle)
+            col = int(math.floor((x - ox) / resolution))
+            row = int(math.floor((y - oy) / resolution))
+            if not (0 <= col < width and 0 <= row < height):
+                continue
+            # Original static inflated cells are not unexpected obstacles.
+            if any((col + dx, row + dy) in static_blocked
+                   for dx in range(-3, 4) for dy in range(-3, 4)):
+                continue
+            key = (math.floor(x / 0.12), math.floor(y / 0.12))
+            clusters.setdefault(key, []).append((x, y, r))
+        viable = [values for values in clusters.values() if len(values) >= 3]
+        if not viable:
+            self._memory_scan_candidate = None
+            self._memory_scan_confirmations = 0
+            return
+        chosen = min(viable, key=lambda values: sum(p[2] for p in values) / len(values))
+        candidate = (sum(p[0] for p in chosen) / len(chosen),
+                     sum(p[1] for p in chosen) / len(chosen))
+        if (self._memory_scan_candidate is not None and
+                self._euclidean_distance(candidate, self._memory_scan_candidate) < 0.18):
+            self._memory_scan_confirmations += 1
+        else:
+            self._memory_scan_confirmations = 1
+        self._memory_scan_candidate = candidate
+        self._memory_scan_stamp = self._now()
+
+    def _remember_obstacle_on_recovery(self, recovery_count):
+        """Add one RAM-only square for a confirmed new Nav2 recovery."""
+        if recovery_count <= self._memory_last_recoveries:
+            return
+        self._memory_last_recoveries = recovery_count
+        candidate = self._memory_scan_candidate
+        if (candidate is None or self._memory_scan_confirmations < 2 or
+                self._memory_scan_stamp is None or
+                self._now() - self._memory_scan_stamp > 1.5):
+            return
+        size = float(self._param('memory_square_size_m'))
+        if size <= 0.0 or not self._load_internal_grid():
+            return
+        if any(self._euclidean_distance(candidate, old) < size * 0.6
+               for old in self._memory_squares):
+            return
+        width, height, resolution, ox, oy, static_blocked = self._internal_grid
+        half = size / 2.0
+        new_cells = set()
+        for col in range(max(0, int(math.floor((candidate[0] - half - ox) / resolution))),
+                         min(width, int(math.ceil((candidate[0] + half - ox) / resolution)))):
+            for row in range(max(0, int(math.floor((candidate[1] - half - oy) / resolution))),
+                             min(height, int(math.ceil((candidate[1] + half - oy) / resolution)))):
+                new_cells.add((col, row))
+        if not new_cells:
+            return
+        self._memory_squares.append(candidate)
+        self._memory_blocked_cells.update(new_cells)
+        # Future-leg cached estimates must be recalculated against new memory.
+        self._path_profile_cache.clear()
+        self._path_distance_cache.clear()
+        self.get_logger().warn(
+            f'[MEMORY] Nav2 recovery {recovery_count}: temporary {size:.2f}m square '
+            f'at ({candidate[0]:.2f}, {candidate[1]:.2f}); '
+            f'{len(self._memory_squares)} remembered; estimator ONLY')
+
     def _internal_astar_profile(self, start, goal):
         """Static-map A* cost profile; None means unknown/unavailable."""
         if not self._load_internal_grid():
             return None
-        width, height, resolution, ox, oy, blocked = self._internal_grid
+        width, height, resolution, ox, oy, static_blocked = self._internal_grid
+        blocked = static_blocked | self._memory_blocked_cells
         def cell(point):
             return (int(math.floor((point[0] - ox) / resolution)),
                     int(math.floor((point[1] - oy) / resolution)))
@@ -2321,6 +2442,9 @@ class TaskManager(Node):
         self._near_goal_committed = False
         self._latest_feedback_position = None
         self._latest_nav_recoveries = 0
+        self._memory_last_recoveries = 0
+        self._memory_scan_candidate = None
+        self._memory_scan_confirmations = 0
         self._last_progress_diagnostic_log = float('-inf')
         if now is not None:
             self._record_progress_sample(now)
@@ -2351,7 +2475,9 @@ class TaskManager(Node):
         except (AttributeError, TypeError, ValueError):
             pass
         try:
-            self._latest_nav_recoveries = int(feedback.number_of_recoveries)
+            recoveries = int(feedback.number_of_recoveries)
+            self._remember_obstacle_on_recovery(recoveries)
+            self._latest_nav_recoveries = recoveries
         except (AttributeError, TypeError, ValueError):
             pass
         self._record_progress_sample(self._now())
