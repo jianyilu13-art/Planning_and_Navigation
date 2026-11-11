@@ -162,8 +162,8 @@ local_costmap:
           inf_is_valid: false
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        inflation_radius: 0.16
-        cost_scaling_factor: 3.0
+        inflation_radius: 0.2
+        cost_scaling_factor: 0.05
       always_send_full_costmap: true
 
 global_costmap:
@@ -262,8 +262,8 @@ velocity_smoother:
     max_velocity: [0.5, 0.0, 2.2]
     min_velocity: [-0.5, 0.0, -2.2]
 
-    max_accel: [0.3, 0.0, 2.0]
-    max_decel: [-1.0, 0.0, -2.0]
+    max_accel: [0.3, 0.0, 2.5]
+    max_decel: [-1.0, 0.0, -2.5]
     odom_topic: /odom
     enable_stamped_cmd_vel: false
 
