@@ -11,8 +11,8 @@ amcl:
     # Motion model
     robot_model_type: nav2_amcl::DifferentialMotionModel
 
-    alpha1: 0.4
-    alpha2: 0.3
+    alpha1: 0.2
+    alpha2: 0.2
     alpha3: 0.4
     alpha4: 0.4
     alpha5: 0.3
@@ -76,7 +76,7 @@ controller_server:
     # (verified in nav2_controller/plugins.xml), so completion is position-only.
     goal_checker:
       plugin: nav2_controller::PositionGoalChecker
-      xy_goal_tolerance: 0.04
+      xy_goal_tolerance: 0.06
       stateful: true
 
     FollowPath:
@@ -93,10 +93,10 @@ controller_server:
       use_velocity_scaled_lookahead_dist: false  # false = use fixed lookahead_dist
 
       # ===== Turning =====
-      rotate_to_heading_angular_vel: 1.5     # In-place turning speed (rad/s)
+      rotate_to_heading_angular_vel: 2.0     # In-place turning speed (rad/s)
       use_rotate_to_heading: true            # Allow rotation to align with heading
       rotate_to_heading_min_angle: 1.041     # Heading error threshold (~45°)
-      max_angular_accel: 1.5                 # Angular acceleration limit (rad/s²)
+      max_angular_accel: 2.5                 # Angular acceleration limit (rad/s²)
       allow_reversing: false                 # Do not follow paths backward
 
       # ===== Goal Approach =====
@@ -227,9 +227,9 @@ smoother_server:
 
 behavior_server:
   ros__parameters:
-    max_rotational_vel: 1.5
-    min_rotational_vel: 1.5
-    rotational_acc_lim: 1.5
+    max_rotational_vel: 2.0
+    min_rotational_vel: 1.8
+    rotational_acc_lim: 2.5
     use_sim_time: false
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
@@ -254,10 +254,11 @@ velocity_smoother:
     use_sim_time: false
     smoothing_frequency: 20.0
     feedback: OPEN_LOOP
-    max_velocity: [0.5, 0.0, 1.8]
-    min_velocity: [-0.5, 0.0, -1.8]
-    max_accel: [0.2, 0.0, 1.5]
-    max_decel: [-1.5, 0.0, -1.5]
+    max_velocity: [0.5, 0.0, 2.2]
+    min_velocity: [-0.5, 0.0, -2.2]
+
+    max_accel: [0.35, 0.0, 2.5]
+    max_decel: [-1.5, 0.0, -2.5]
     odom_topic: /odom
     enable_stamped_cmd_vel: false
 

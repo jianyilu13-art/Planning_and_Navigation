@@ -205,7 +205,9 @@ class TaskManager(Node):
             'progress_diagnostic_period_seconds': 5.0,
 
             # Lightweight ordered-subsequence waypoint selection.
-            'straight_speed': 0.28,
+            'straight_speed': 0.27,
+            'straight_acceleration': 0.35,
+            'straight_deceleration': 1.5,
             'effective_angular_speed': 0.50,
             'significant_turn_threshold_degrees': 30.0,
             'turn_penalty_seconds': 3.0,
@@ -1096,6 +1098,49 @@ class TaskManager(Node):
     # 10. TIME-AWARE GOAL SELECTION
     # ========================================================
 
+    def _estimate_straight_time(self, distance):
+        """Estimate travel time using a trapezoidal velocity profile."""
+
+        distance = max(0.0, float(distance))
+
+        if distance == 0.0:
+            return 0.0
+
+        v = self._param('straight_speed')
+        a = self._param('straight_acceleration')
+        b = self._param('straight_deceleration')
+
+        if v <= 0.0 or a <= 0.0 or b <= 0.0:
+            raise ValueError("Straight motion parameters must be positive")
+
+        acceleration_distance = v * v / (2.0 * a)
+        deceleration_distance = v * v / (2.0 * b)
+
+        if distance >= acceleration_distance + deceleration_distance:
+            acceleration_time = v / a
+            deceleration_time = v / b
+
+            cruise_distance = (
+                distance
+                - acceleration_distance
+                - deceleration_distance
+            )
+
+            cruise_time = cruise_distance / v
+
+            return (
+                acceleration_time
+                + cruise_time
+                + deceleration_time
+            )
+
+        # Short route: triangular velocity profile
+        peak_velocity = math.sqrt(
+            2.0 * distance * a * b / (a + b)
+        )
+
+        return peak_velocity / a + peak_velocity / b
+
     def _parse_waypoint_scores(self):
         """Parse optional ``LABEL:SCORE`` parameter entries."""
         for name in (
@@ -1311,18 +1356,21 @@ class TaskManager(Node):
         }
 
     def _maneuver_penalty(self, angle, in_place=False):
-        """Ordinary geometric bends cost 3.5s; likely waypoint spins cost 25s.
+        """Estimate ordinary turns separately from in-place reversals."""
 
-        A cumulative U-shaped path is never itself a spin. A spin is only
-        considered at the boundary of consecutive legs, with planner-backed
-        incoming/outgoing tangent headings (or live heading for the first leg).
-        """
         degrees = abs(math.degrees(angle))
-        if degrees < self._param('significant_turn_threshold_degrees'):
+
+        if degrees < 30.0:
             return 0.0
-        if in_place and degrees >= self._param('inplace_180_angle_threshold'):
+
+        if (
+            in_place
+            and degrees >= self._param('inplace_180_angle_threshold')
+        ):
             return self._param('inplace_180_turn_penalty')
-        return self._param('turn_penalty_seconds')
+
+        # Ordinary turns: increase gradually up to 90 degrees.
+        return min(5.0, 5.0 * degrees / 90.0)
 
     def _leg_time_breakdown(
         self, distance, label, profile=None, incoming_heading=None,
@@ -1347,7 +1395,7 @@ class TaskManager(Node):
             ):
                 initial_turn = candidate
         turn_angle = sum(abs(turn) for turn in turns)
-        straight_time = distance / self._param('straight_speed')
+        straight_time = self._estimate_straight_time(distance)
         turning_time = sum(self._maneuver_penalty(turn) for turn in turns)
         reversal = False
         if initial_turn is not None:
