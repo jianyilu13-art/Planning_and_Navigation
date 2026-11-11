@@ -1365,21 +1365,27 @@ class TaskManager(Node):
         }
 
     def _maneuver_penalty(self, angle, in_place=False):
-        """Estimate ordinary turns separately from in-place reversals."""
+        """
+        Estimate turning time from angular displacement
+        and observed effective angular velocity.
 
-        degrees = abs(math.degrees(angle))
+        No arbitrary nonlinear exponent.
+        No abrupt 165-degree penalty.
+        """
 
-        if degrees < 30.0:
+        angle = abs(float(angle))
+
+        if angle <= 0.0:
             return 0.0
 
-        if (
-            in_place
-            and degrees >= self._param('inplace_180_angle_threshold')
-        ):
-            return self._param('inplace_180_turn_penalty')
+        angular_speed = self._param('effective_angular_speed')
 
-        # Ordinary turns: increase gradually up to 90 degrees.
-        return min(5.0, 5.0 * degrees / 90.0)
+        if angular_speed <= 0.0:
+            raise ValueError('effective_angular_speed must be positive')
+
+        turning_time = angle / angular_speed
+
+        return turning_time
 
     def _leg_time_breakdown(
         self, distance, label, profile=None, incoming_heading=None,
@@ -1409,12 +1415,9 @@ class TaskManager(Node):
         reversal = False
         if initial_turn is not None:
             turn_angle += abs(initial_turn)
-            reversal = (
-                incoming_heading_reliable
-                and not profile.get('uncertain', True)
-                and abs(math.degrees(initial_turn)) >=
-                    self._param('inplace_180_angle_threshold')
-            )
+            # A large heading difference alone is not sufficient evidence
+            # of a genuine in-place reversal.
+            reversal = False
             turning_time += self._maneuver_penalty(
                 initial_turn, in_place=reversal
             )

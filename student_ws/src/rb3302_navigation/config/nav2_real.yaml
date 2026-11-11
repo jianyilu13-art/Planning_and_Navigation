@@ -61,7 +61,7 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false          # Use Gazebo time when true
-    controller_frequency: 5.0  # Controller updates per second  #
+    controller_frequency: 10.0  # Controller updates per second  #
 
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["goal_checker"]
@@ -83,12 +83,12 @@ controller_server:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
 
       # ===== Forward Movement =====
-      desired_linear_vel: 0.27                # Desired forward speed (m/s)
+      desired_linear_vel: 0.3                # Desired forward speed (m/s)
 
       # ===== Path Following =====
-      lookahead_dist: 0.3                    # Fixed lookahead distance (m)
-      min_lookahead_dist: 0.3                # Minimum adaptive lookahead (m)
-      max_lookahead_dist: 0.9                # Maximum adaptive lookahead (m)
+      lookahead_dist: 0.2                    # Fixed lookahead distance (m)
+      min_lookahead_dist: 0.2                # Minimum adaptive lookahead (m)
+      max_lookahead_dist: 0.5                # Maximum adaptive lookahead (m)
       lookahead_time: 1.5                    # Time used for adaptive lookahead (s)
       use_velocity_scaled_lookahead_dist: false  # false = use fixed lookahead_dist
 
@@ -110,8 +110,8 @@ controller_server:
       # ===== Speed Regulation =====
       use_regulated_linear_velocity_scaling: true  # Slow down on sharp curves
       use_cost_regulated_linear_velocity_scaling: false  # Disable cost-based slowdown
-      regulated_linear_scaling_min_radius: 0.9  # Turn radius below which speed is reduced (m)
-      regulated_linear_scaling_min_speed: 0.05  # Minimum regulated forward speed (m/s)
+      regulated_linear_scaling_min_radius: 0.7  # Turn radius below which speed is reduced (m)
+      regulated_linear_scaling_min_speed: 0.07  # Minimum regulated forward speed (m/s)
 
       # ===== TF =====
       transform_tolerance: 0.1              # TF lookup tolerance (s)
