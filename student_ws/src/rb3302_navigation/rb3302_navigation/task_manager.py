@@ -230,6 +230,8 @@ class TaskManager(Node):
             'dynamic_replan_period_seconds': 5.0,
             'dynamic_switch_confirmation_count': 2,
             'dynamic_switch_min_saving_seconds': 8.0,
+            'dynamic_detour_ratio': 1.8,
+            'dynamic_detour_extra_meters': 0.8,
             # Optional entries such as ["H:2", "X:3"].  Unlisted targets
             # have score 1.0; task.yaml remains backward compatible.
             'waypoint_scores': [''],
@@ -466,6 +468,8 @@ class TaskManager(Node):
         self._dynamic_candidate = None
         self._dynamic_confirmations = 0
         self._dynamic_switch_target = None
+        self._dynamic_baseline_distance = None
+        self._dynamic_detour_confirmations = 0
 
         # Progress is measured from Nav2 distance feedback, map-frame target
         # distance, and odometry displacement.  The rolling window naturally
@@ -1786,11 +1790,8 @@ class TaskManager(Node):
             self._remaining_mission_time(now)
             - self._param('mission_time_reserve_seconds')
         )
-        if available <= 0.0:
-            for label in candidates:
-                self._waypoint_status[label] = WaypointState.SKIPPED
-            self._complete_mission('Mission reserve reached')
-            return
+        # Reserve is advisory: keep attempting goals until the hard deadline.
+        available = max(0.0, available)
 
         self._invalidate_dynamic_checks()
         self._selection_cycle += 1
@@ -1939,18 +1940,31 @@ class TaskManager(Node):
                 f'failures={self._waypoint_failures[label]}'
             )
 
-        if best is None and len(candidates) == 1 and self._remaining_mission_time() > 0.0:
-            label = candidates[0]
-            self.get_logger().warn(
-                f'[SELECTION] Final eligible goal {label}: last attempt despite '
-                'estimated time exceeding mission time; hard deadline remains active'
-            )
-            best = ((label,), float('inf'), self._waypoint_scores[label])
+        if best is None and self._remaining_mission_time() > 0.0:
+            # No feasible sequence fits the soft budget. Choose the fastest
+            # eligible single leg rather than stopping before the hard deadline.
+            eligible = [label for label in candidates
+                        if (None, label) not in self._selection_blocked_edges]
+            if eligible:
+                label = min(eligible, key=lambda candidate: self._leg_time_breakdown(
+                    self._selection_distances[(None, candidate)], candidate,
+                    self._selection_profiles.get((None, candidate)),
+                    self._selection_initial_heading)['total'])
+                estimate = self._leg_time_breakdown(
+                    self._selection_distances[(None, label)], label,
+                    self._selection_profiles.get((None, label)),
+                    self._selection_initial_heading)['total']
+                best = ((label,), estimate, self._waypoint_scores[label])
+                self.get_logger().warn(
+                    f'[SELECTION] No sequence fits soft time budget; attempting '
+                    f'fastest eligible goal {label} ({estimate:.1f}s estimated) '
+                    'until hard deadline')
 
         if best is None:
+            # No safely eligible route, not merely an underestimated time budget.
             for label in candidates:
                 self._waypoint_status[label] = WaypointState.SKIPPED
-            self._complete_mission('No feasible target fits the remaining time')
+            self._complete_mission('No eligible reachable target remains')
             return
 
         sequence, estimated_time, reward = best
@@ -1970,6 +1984,8 @@ class TaskManager(Node):
         self.goal_target = self.converter.coordinate(label)
         self._waypoint_status[label] = WaypointState.ACTIVE
         self._waypoint_started_at = self._now()
+        self._dynamic_baseline_distance = self._selection_distances.get((None, label))
+        self._dynamic_detour_confirmations = 0
         self._near_goal_committed = False
         self._goal_attempts = 0
         self._navigation_retries = 0
@@ -2035,8 +2051,9 @@ class TaskManager(Node):
             self._remaining_mission_time(now)
             - self._param('mission_time_reserve_seconds')
         )
-        if available <= 0.0:
-            return False, 'insufficient mission time after reserve'
+        if self._remaining_mission_time(now) <= 0.0:
+            return False, 'hard mission deadline expired'
+        available = max(0.0, available)
 
         candidates = [label] + [
             candidate for candidate in self.task['targets']
@@ -2086,9 +2103,12 @@ class TaskManager(Node):
                 (remaining_path is not None and remaining_path <=
                  self._param('near_goal_path_threshold_meters'))):
             return True, 'near-goal path commitment: preserve current waypoint'
-        if best is None or best[0][0] != label:
-            alternative = None if best is None else best[0][0]
-            return False, f'alternative target {alternative} has better time value'
+        if best is None:
+            # Time estimates alone must not end the mission. Retry the current
+            # goal while Nav2 is safe and the hard deadline has not expired.
+            return True, 'no sequence fits soft budget; keep attempting until deadline'
+        if best[0][0] != label:
+            return False, f'alternative target {best[0][0]} has better time value'
         return True, 'same waypoint remains best feasible choice'
 
     # ========================================================
@@ -2162,12 +2182,8 @@ class TaskManager(Node):
             self._dynamic_compare(cycle)
 
     def _dynamic_tick(self, now):
+        """Reconsider only a confirmed detour; do not depend on slow planner probes."""
         if self.goal_pending or self._dynamic_switch_target is not None:
-            return
-        if self._dynamic_deadline is not None:
-            if now >= self._dynamic_deadline:
-                # Incomplete probes are unknown, never interpreted as blocked.
-                self._dynamic_compare(self._dynamic_cycle)
             return
         if now < self._dynamic_next_check:
             return
@@ -2178,28 +2194,35 @@ class TaskManager(Node):
             return
         later = [label for label in order[order.index(active) + 1:]
                  if self._waypoint_status[label] is WaypointState.PENDING]
-        if not later or not self.path_client.wait_for_server(timeout_sec=0.0):
+        if not later:
             return
-        self._dynamic_cycle += 1
-        cycle = self._dynamic_cycle
-        self._dynamic_profiles = {}
-        self._dynamic_blocked = set()
-        self._dynamic_pending = {(None, label) for label in [active] + later}
-        self._dynamic_deadline = now + self._param('path_estimation_timeout_seconds')
+        remaining = self._fresh_remaining_path(now)
+        if remaining is None or self._near_goal_committed or remaining <= self._param('near_goal_path_threshold_meters'):
+            self._dynamic_detour_confirmations = 0
+            return
+        # Static-map A* gives a conservative baseline from CURRENT position.
+        # Nav2 feedback incorporates dynamic obstacles and detours.
         origin = self._current_position()
-        for label in [active] + later:
-            edge = (None, label)
-            request = ComputePathToPose.Goal()
-            request.goal = self._make_planner_pose(*self.converter.coordinate(label))
-            request.use_start = False
-            try:
-                future = self.path_client.send_goal_async(request)
-                future.add_done_callback(
-                    lambda done, cid=cycle, e=edge:
-                    self._dynamic_probe_response(done, cid, e)
-                )
-            except Exception:
-                self._dynamic_probe_finish(cycle, edge)
+        static_profile = self._internal_astar_profile(origin, self.converter.coordinate(active))
+        if static_profile is None:
+            return
+        baseline = max(static_profile['distance'], 0.01)
+        detour = (remaining >= baseline * self._param('dynamic_detour_ratio')
+                  and remaining - baseline >= self._param('dynamic_detour_extra_meters'))
+        self._dynamic_detour_confirmations = (self._dynamic_detour_confirmations + 1 if detour else 0)
+        if self._dynamic_detour_confirmations < int(self._param('dynamic_switch_confirmation_count')):
+            return
+        # Build current-to-goal profiles locally, without ComputePathToPose
+        # requests that have repeatedly timed out in real-world runs.
+        self._dynamic_profiles = {(None, active): dict(static_profile)}
+        self._dynamic_profiles[(None, active)]['distance'] = remaining
+        for label in later:
+            profile = self._euclidean_profile(origin, self.converter.coordinate(label))
+            self._dynamic_profiles[(None, label)] = profile
+        self.get_logger().warn(
+            f'[DYNAMIC] Confirmed detour for {active}: Nav2 remaining={remaining:.2f}m, '
+            f'static A*={baseline:.2f}m; reconsidering ordered targets')
+        self._dynamic_compare(self._dynamic_cycle)
 
     def _fresh_remaining_path(self, now):
         """Use only fresh Nav2 planned-route distance, never map straight-line distance."""
@@ -2229,9 +2252,9 @@ class TaskManager(Node):
         return self._param('progress_window_seconds')
 
     def _dynamic_compare(self, cycle):
-        if cycle != self._dynamic_cycle or self.state is not TaskState.NAVIGATING:
+        """Switch only if another ordered sequence offers a real advantage."""
+        if self.state is not TaskState.NAVIGATING:
             return
-        self._dynamic_deadline = None
         active = self.current_goal_label
         order = self.task['targets']
         if active not in order:
@@ -2240,85 +2263,50 @@ class TaskManager(Node):
                  if self._waypoint_status[label] is WaypointState.PENDING]
         if not later:
             return
-        # Do not switch based on Euclidean estimates or incomplete probes.
-        if any((None, label) not in self._dynamic_profiles
-               and (None, label) not in self._dynamic_blocked
-               for label in [active] + later):
-            return
         now = self._now()
-        remaining_path = self._fresh_remaining_path(now)
-        if (self._near_goal_committed or
-                (remaining_path is not None and remaining_path <=
-                 self._param('near_goal_path_threshold_meters'))):
+        remaining = self._fresh_remaining_path(now)
+        if self._near_goal_committed or (remaining is not None and remaining <=
+                                        self._param('near_goal_path_threshold_meters')):
             return
         candidates = [active] + later
         coordinates = {label: self.converter.coordinate(label) for label in candidates}
         profiles = dict(self._dynamic_profiles)
-        distances = {edge: profile['distance'] for edge, profile in profiles.items()}
-        # Cached future transitions are estimates; refresh the first leg on
-        # every cycle, where new obstacles are most consequential.
+        for label in candidates:
+            edge = (None, label)
+            if edge not in profiles:
+                profiles[edge] = self._euclidean_profile(self._current_position(), coordinates[label])
         for first, second in itertools.combinations(candidates, 2):
             edge = (first, second)
-            profile = self._path_profile_cache.get(edge)
-            if profile is None:
-                profile = self._euclidean_profile(coordinates[first], coordinates[second])
-            profiles[edge] = profile
-            distances[edge] = profile['distance']
-        available = self._remaining_mission_time(now)
+            profiles[edge] = self._path_profile_cache.get(edge) or self._euclidean_profile(
+                coordinates[first], coordinates[second])
+        distances = {edge: profile['distance'] for edge, profile in profiles.items()}
+        available = max(0.0, self._remaining_mission_time(now) -
+                        self._param('mission_time_reserve_seconds'))
         heading = self._current_heading()
         keep = self._evaluate_candidate_sequences(
-            candidates, distances, self._dynamic_blocked, available,
-            profiles=profiles, initial_heading=heading, required_first=active)
+            candidates, distances, set(), available, profiles=profiles,
+            initial_heading=heading, required_first=active)
         skip = self._evaluate_candidate_sequences(
-            later, distances, self._dynamic_blocked, available,
-            profiles=profiles, initial_heading=heading)
-        if skip is None:
+            later, distances, set(), available, profiles=profiles,
+            initial_heading=heading)
+        skipped = sum(state is WaypointState.SKIPPED for state in self._waypoint_status.values())
+        # Preserve preference for at most one skipped goal unless current route
+        # is independently confirmed blocked (not inferred from a timeout).
+        if skipped >= 1 or skip is None:
             return
-        completed = len(self._completed_waypoints)
-        skipped = sum(state is WaypointState.SKIPPED
-                      for state in self._waypoint_status.values())
-        keep_count = completed + (len(keep[0]) if keep else 0)
-        skip_count = completed + len(skip[0])
-        # After one skip, protect the three-goal target. Only switch again
-        # if the current route is planner-confirmed blocked (not just slower).
-        blocked_active = (None, active) in self._dynamic_blocked
-        if skipped >= 1 and not blocked_active:
-            return
-        if not blocked_active:
-            if keep is None:
-                better = True
-            elif skip_count > keep_count:
-                better = True
-            elif skip_count == keep_count:
-                better = (keep[1] - skip[1] >=
-                          self._param('dynamic_switch_min_saving_seconds'))
-            else:
-                better = False
-        else:
-            better = True
-        if not better:
-            self._dynamic_candidate = None
-            self._dynamic_confirmations = 0
-            return
+        if keep is not None:
+            if len(skip[0]) < len(keep[0]):
+                return
+            if len(skip[0]) == len(keep[0]) and (keep[1] - skip[1] <
+                    self._param('dynamic_switch_min_saving_seconds')):
+                return
         choice = skip[0][0]
-        if self._dynamic_candidate == choice:
-            self._dynamic_confirmations += 1
-        else:
-            self._dynamic_candidate = choice
-            self._dynamic_confirmations = 1
         self.get_logger().info(
             f'[DYNAMIC] keep={None if keep is None else list(keep[0])} '
-            f'skip={list(skip[0])}; skips={skipped}; '
-            f'confirmation={self._dynamic_confirmations}/'
-            f'{self._param("dynamic_switch_confirmation_count")}')
-        if self._dynamic_confirmations < int(self._param('dynamic_switch_confirmation_count')):
-            return
+            f'skip={list(skip[0])}; confirmed detour; switching toward {choice}')
         self._dynamic_switch_target = choice
         self._invalidate_dynamic_checks()
-        self.get_logger().warn(
-            f'[DYNAMIC] Switching away from {active} toward {choice}; '
-            'waiting for confirmed cancellation before selecting again')
-        self._begin_cancellation('dynamic route reevaluation', for_retry=True)
+        self._begin_cancellation('confirmed dynamic detour', for_retry=True)
 
     # ========================================================
     # 11. PROGRESS-AWARE NAVIGATION MONITORING
