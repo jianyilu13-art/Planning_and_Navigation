@@ -23,6 +23,8 @@ IMPORTANT:
 # ============================================================
 
 import enum
+import heapq
+import os
 import itertools
 import math
 import yaml
@@ -219,9 +221,11 @@ class TaskManager(Node):
             'inplace_180_angle_threshold': 165.0,
             'path_simplification_tolerance': 0.03,
             'navigation_safety_margin_seconds': 0.0,
-            'mission_time_reserve_seconds': 0.0,
+            'mission_time_reserve_seconds': 10.0,
             'selection_retry_limit': 1,
             'path_estimation_timeout_seconds': 10.0,
+            'internal_map_yaml': '/home/ubuntu/rb3302_final_proj_code/student_ws/maps/rb3302_map.yaml',
+            'internal_astar_clearance_m': 0.11,
             'failure_penalty_seconds': 0.0,
             'dynamic_replan_period_seconds': 5.0,
             'dynamic_switch_confirmation_count': 2,
@@ -252,6 +256,9 @@ class TaskManager(Node):
         # Register parameters with ROS 2
         for name, value in defaults.items():
             self.declare_parameter(name, value)
+
+        self._internal_grid = None
+        self._internal_grid_error = None
 
         # ----------------------------------------------------
         # B. Create ROS publishers
@@ -1348,8 +1355,155 @@ class TaskManager(Node):
             'uncertain': False,
         }
 
+    def _load_internal_grid(self):
+        """Load ROS map YAML and binary PGM using Python standard library only."""
+        if self._internal_grid is not None:
+            return True
+        if self._internal_grid_error is not None:
+            return False
+        try:
+            map_yaml = self._param('internal_map_yaml')
+            with open(map_yaml, 'r') as stream:
+                info = yaml.safe_load(stream)
+            image_path = info['image']
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(os.path.dirname(map_yaml), image_path)
+            with open(image_path, 'rb') as stream:
+                def token():
+                    while True:
+                        line = stream.readline()
+                        if not line:
+                            raise ValueError('Unexpected end of PGM header')
+                        line = line.split(b'#', 1)[0].strip()
+                        if line:
+                            return line
+                if token() != b'P5':
+                    raise ValueError('Internal estimator expects binary P5 PGM')
+                width, height = map(int, token().split())
+                maxval = int(token())
+                if maxval != 255:
+                    raise ValueError('Internal estimator expects 8-bit PGM')
+                pixels = stream.read(width * height)
+                if len(pixels) != width * height:
+                    raise ValueError('Incomplete map image')
+            resolution = float(info['resolution'])
+            origin = info['origin']
+            if abs(float(origin[2])) > 1e-8:
+                raise ValueError('Rotated occupancy-map origin unsupported')
+            negate = int(info.get('negate', 0))
+            occupied_threshold = float(info.get('occupied_thresh', 0.65))
+            free_threshold = float(info.get('free_thresh', 0.196))
+            blocked = set()
+            for row in range(height):
+                for col in range(width):
+                    pixel = pixels[row * width + col]
+                    probability = (pixel / 255.0 if negate else
+                                   (255 - pixel) / 255.0)
+                    # Treat both occupied and unknown cells as blocked.
+                    if probability > free_threshold:
+                        blocked.add((col, height - 1 - row))
+            clearance = max(0.0, float(self._param('internal_astar_clearance_m')))
+            radius_cells = int(math.ceil(clearance / resolution))
+            offsets = [(dx, dy) for dx in range(-radius_cells, radius_cells + 1)
+                       for dy in range(-radius_cells, radius_cells + 1)
+                       if math.hypot(dx, dy) * resolution <= clearance + 1e-9]
+            inflated = set()
+            for col, row in blocked:
+                for dx, dy in offsets:
+                    x, y = col + dx, row + dy
+                    if 0 <= x < width and 0 <= y < height:
+                        inflated.add((x, y))
+            self._internal_grid = (width, height, resolution,
+                                   float(origin[0]), float(origin[1]), inflated)
+            self.get_logger().info(
+                f'[ESTIMATOR] Internal A* loaded {width}x{height} grid; '
+                f'clearance={clearance:.3f}m; blocked cells={len(inflated)}'
+            )
+            return True
+        except Exception as exc:
+            self._internal_grid_error = str(exc)
+            self.get_logger().error(f'[ESTIMATOR] Internal A* unavailable: {exc}')
+            return False
+
+    def _internal_astar_profile(self, start, goal):
+        """Static-map A* cost profile; None means unknown/unavailable."""
+        if not self._load_internal_grid():
+            return None
+        width, height, resolution, ox, oy, blocked = self._internal_grid
+        def cell(point):
+            return (int(math.floor((point[0] - ox) / resolution)),
+                    int(math.floor((point[1] - oy) / resolution)))
+        source, target = cell(start), cell(goal)
+        def valid(c):
+            return (0 <= c[0] < width and 0 <= c[1] < height
+                    and c not in blocked)
+        # Do not silently shift a goal to another cell across a wall.
+        if not valid(source) or not valid(target):
+            return None
+        directions = [(dx, dy, math.hypot(dx, dy))
+                      for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                      if dx or dy]
+        queue = [(math.dist(source, target), 0.0, source)]
+        distances = {source: 0.0}
+        previous = {}
+        while queue:
+            _, cost, current = heapq.heappop(queue)
+            if cost > distances[current] + 1e-9:
+                continue
+            if current == target:
+                break
+            for dx, dy, step in directions:
+                nxt = (current[0] + dx, current[1] + dy)
+                if not valid(nxt):
+                    continue
+                if dx and dy and (not valid((current[0] + dx, current[1]))
+                                  or not valid((current[0], current[1] + dy))):
+                    continue
+                new_cost = cost + step
+                if new_cost < distances.get(nxt, float('inf')) - 1e-9:
+                    distances[nxt] = new_cost
+                    previous[nxt] = current
+                    heapq.heappush(queue,
+                                   (new_cost + math.dist(nxt, target), new_cost, nxt))
+        if target not in distances:
+            return None
+        route = [target]
+        while route[-1] != source:
+            route.append(previous[route[-1]])
+        route.reverse()
+        # Collision-checked string pulling avoids false turns from grid jitter.
+        def visible(a, b):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            steps = max(1, int(math.ceil(math.hypot(dx, dy) * 4)))
+            for i in range(steps + 1):
+                t = i / steps
+                x, y = a[0] + dx * t, a[1] + dy * t
+                # Check the nearby cell centers conservatively.
+                for cx in (math.floor(x), math.ceil(x)):
+                    for cy in (math.floor(y), math.ceil(y)):
+                        if not valid((cx, cy)):
+                            return False
+            return True
+        simplified = [route[0]]
+        index = 0
+        while index < len(route) - 1:
+            nxt = len(route) - 1
+            while nxt > index + 1 and not visible(route[index], route[nxt]):
+                nxt -= 1
+            simplified.append(route[nxt])
+            index = nxt
+        points = [(ox + (c[0] + 0.5) * resolution,
+                   oy + (c[1] + 0.5) * resolution) for c in simplified]
+        profile = self._analyze_path(points)
+        profile['uncertain'] = False
+        profile['source'] = 'internal_astar'
+        return profile
+
     def _euclidean_profile(self, start, goal):
-        """Return an explicitly uncertain obstacle-unaware fallback profile."""
+        """Last-resort obstacle-unaware estimate, explicitly marked uncertain."""
+        profile = self._internal_astar_profile(start, goal)
+        if profile is not None:
+            return profile
         distance = self._euclidean_distance(start, goal)
         heading = None
         if distance > 1e-9:
@@ -1436,8 +1590,8 @@ class TaskManager(Node):
             'dwell_time': dwell_time,
             'safety_margin': safety_margin,
             'failure_penalty': failure_penalty,
-            'total': (straight_time + turning_time + dwell_time
-                      + safety_margin + failure_penalty),
+            'total': (2.1 * (straight_time + turning_time + safety_margin + failure_penalty)
+                    + dwell_time),
             'last_heading': profile.get('last_heading'),
             'uncertain': bool(profile.get('uncertain', False)),
         }
@@ -1684,13 +1838,28 @@ class TaskManager(Node):
             f'({self._selection_origin[0]:.3f}, '
             f'{self._selection_origin[1]:.3f})'
         )
-        if not self.path_client.wait_for_server(timeout_sec=0.0):
-            self.get_logger().warn(
-                '[SELECTION] ComputePathToPose unavailable; using uncertain, '
-                'obstacle-unaware Euclidean estimates'
-            )
-            self._finalize_goal_selection(cycle)
-            return
+        # Internal static-map A* replaces slow ComputePathToPose estimation.
+        # Actual navigation continues to use the official Nav2 stack.
+        for label in candidates:
+            edge = (None, label)
+            profile = self._internal_astar_profile(self._selection_origin,
+                                                   coordinates[label])
+            if profile is not None:
+                self._selection_profiles[edge] = profile
+                self._selection_distances[edge] = profile['distance']
+                self._selection_path_edges.add(edge)
+        for first, second in itertools.permutations(candidates, 2):
+            edge = (first, second)
+            profile = self._internal_astar_profile(coordinates[first],
+                                                   coordinates[second])
+            if profile is not None:
+                self._selection_profiles[edge] = profile
+                self._selection_distances[edge] = profile['distance']
+                self._path_profile_cache[edge] = dict(profile)
+            else:
+                self._path_profile_cache.pop(edge, None)
+        self._finalize_goal_selection(cycle)
+        return
 
         requests = [
             (
@@ -1749,7 +1918,7 @@ class TaskManager(Node):
         )
         for label in candidates:
             edge = (None, label)
-            source = 'planner' if edge in self._selection_path_edges else 'euclidean'
+            source = self._selection_profiles[edge].get('source', ('planner' if edge in self._selection_path_edges else 'euclidean'))
             distance = self._selection_distances[edge]
             breakdown = self._leg_time_breakdown(
                 distance,
