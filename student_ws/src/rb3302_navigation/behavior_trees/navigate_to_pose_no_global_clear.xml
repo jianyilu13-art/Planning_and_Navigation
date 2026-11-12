@@ -7,13 +7,13 @@
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="2" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
 
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
         <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
 
-        <RateController hz="1.0">
+        <RateController hz="0.5">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
             <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
             <Sequence>
@@ -46,7 +46,7 @@
           <GoalUpdated/>
           <RoundRobin name="RecoveryActions">
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
-            <Spin spin_dist="1.57" error_code_id="{spin_error_code}"/>
+            <Spin spin_dist="0.35" error_code_id="{spin_error_code}"/>
             <Wait wait_duration="5.0"/>
             <BackUp backup_dist="0.30" backup_speed="0.15" error_code_id="{backup_code_id}"/>
           </RoundRobin>
