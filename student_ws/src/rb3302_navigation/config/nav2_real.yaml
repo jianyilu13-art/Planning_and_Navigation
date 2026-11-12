@@ -81,7 +81,7 @@ controller_server:
     # (verified in nav2_controller/plugins.xml), so completion is position-only.
     goal_checker:
       plugin: nav2_controller::PositionGoalChecker
-      xy_goal_tolerance: 0.06
+      xy_goal_tolerance: 0.04
       stateful: true
 
     FollowPath:
@@ -100,7 +100,7 @@ controller_server:
       # ===== Turning =====
       rotate_to_heading_angular_vel: 2.0     # In-place turning speed (rad/s)
       use_rotate_to_heading: true            # Allow rotation to align with heading
-      rotate_to_heading_min_angle: 1.5       # Heading error threshold (~45°)
+      rotate_to_heading_min_angle: 1.6       # Heading error threshold (~45°)
       max_angular_accel: 2.5                 # Angular acceleration limit (rad/s²)
       allow_reversing: false                 # Do not follow paths backward
 

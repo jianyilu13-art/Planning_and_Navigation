@@ -46,7 +46,7 @@
           <GoalUpdated/>
           <RoundRobin name="RecoveryActions">
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
-            <Spin spin_dist="0.35" error_code_id="{spin_error_code}"/>
+            <Spin spin_dist="0.05" error_code_id="{spin_error_code}"/>
             <Wait wait_duration="5.0"/>
             <BackUp backup_dist="0.30" backup_speed="0.15" error_code_id="{backup_code_id}"/>
           </RoundRobin>
