@@ -100,7 +100,7 @@ controller_server:
       # ===== Turning =====
       rotate_to_heading_angular_vel: 2.0     # In-place turning speed (rad/s)
       use_rotate_to_heading: true            # Allow rotation to align with heading
-      rotate_to_heading_min_angle: 1.6       # Heading error threshold (~45°)
+      rotate_to_heading_min_angle: 1.5       # Heading error threshold (~45°)
       max_angular_accel: 2.5                 # Angular acceleration limit (rad/s²)
       allow_reversing: false                 # Do not follow paths backward
 
@@ -262,8 +262,8 @@ velocity_smoother:
     max_velocity: [0.5, 0.0, 2.2]
     min_velocity: [-0.5, 0.0, -2.2]
 
-    max_accel: [0.3, 0.0, 2.5]
-    max_decel: [-1.0, 0.0, -2.5]
+    max_accel: [0.3, 0.0, 1.5]
+    max_decel: [-1.0, 0.0, -1.5]
     odom_topic: /odom
     enable_stamped_cmd_vel: false
 
